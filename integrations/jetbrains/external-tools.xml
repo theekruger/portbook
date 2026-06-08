@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  portbook External Tools for JetBrains IDEs (IntelliJ IDEA, PyCharm, WebStorm, GoLand, RubyMine, etc).
+
+  This is the native IDE "External Tools" format. Drop this file (named tools/portbook.xml; the
+  toolSet name below MUST match the file name, minus .xml) into your IDE's per-config tools/ directory
+  and restart. The entries then appear under Settings/Preferences > Tools > External Tools and under
+  the Tools menu. See README.md in this folder for the exact per-OS path and keymap binding steps.
+
+  Requires the `portbook` CLI on PATH (e.g. `npm link` in the repo). All tools are CLI only, zero deps.
+  $ProjectName$ and $ProjectFileDir$ are IDE macros the IDE expands at run time: project name becomes
+  the reservation key (the project arg), project dir becomes the command's working directory.
+-->
+<toolSet name="portbook">
+  <tool name="portbook: list" description="List this machine's port reservations + live BOUND state" showInMainMenu="true" showInEditor="false" showInProject="true" showInSearchPopup="true" disabled="false" useConsole="true" showConsoleOnStdOut="true" showConsoleOnStdErr="true" synchronizeAfterRun="false">
+    <exec>
+      <option name="COMMAND" value="portbook" />
+      <option name="PARAMETERS" value="list" />
+      <option name="WORKING_DIRECTORY" value="$ProjectFileDir$" />
+    </exec>
+  </tool>
+  <tool name="portbook: list (this project)" description="List reservations for the current project only" showInMainMenu="true" showInEditor="false" showInProject="true" showInSearchPopup="true" disabled="false" useConsole="true" showConsoleOnStdOut="true" showConsoleOnStdErr="true" synchronizeAfterRun="false">
+    <exec>
+      <option name="COMMAND" value="portbook" />
+      <option name="PARAMETERS" value="list --project $ProjectName$" />
+      <option name="WORKING_DIRECTORY" value="$ProjectFileDir$" />
+    </exec>
+  </tool>
+  <tool name="portbook: scan" description="Show everything ACTUALLY listening on this machine (flags unmanaged ports)" showInMainMenu="true" showInEditor="false" showInProject="true" showInSearchPopup="true" disabled="false" useConsole="true" showConsoleOnStdOut="true" showConsoleOnStdErr="true" synchronizeAfterRun="false">
+    <exec>
+      <option name="COMMAND" value="portbook" />
+      <option name="PARAMETERS" value="scan" />
+      <option name="WORKING_DIRECTORY" value="$ProjectFileDir$" />
+    </exec>
+  </tool>
+  <tool name="portbook: env (ecosystem)" description="Full ecosystem: host ports + containers + WSL" showInMainMenu="true" showInEditor="false" showInProject="true" showInSearchPopup="true" disabled="false" useConsole="true" showConsoleOnStdOut="true" showConsoleOnStdErr="true" synchronizeAfterRun="false">
+    <exec>
+      <option name="COMMAND" value="portbook" />
+      <option name="PARAMETERS" value="env" />
+      <option name="WORKING_DIRECTORY" value="$ProjectFileDir$" />
+    </exec>
+  </tool>
+  <tool name="portbook: reserve for project" description="Reserve one free port for the current project (uses the project name)" showInMainMenu="true" showInEditor="false" showInProject="true" showInSearchPopup="true" disabled="false" useConsole="true" showConsoleOnStdOut="true" showConsoleOnStdErr="true" synchronizeAfterRun="false">
+    <exec>
+      <option name="COMMAND" value="portbook" />
+      <option name="PARAMETERS" value="reserve --project $ProjectName$ --count 1 --owner jetbrains" />
+      <option name="WORKING_DIRECTORY" value="$ProjectFileDir$" />
+    </exec>
+  </tool>
+  <tool name="portbook: serve (dashboard)" description="Start the live web dashboard at http://127.0.0.1:7800" showInMainMenu="true" showInEditor="false" showInProject="true" showInSearchPopup="true" disabled="false" useConsole="true" showConsoleOnStdOut="true" showConsoleOnStdErr="true" synchronizeAfterRun="false">
+    <exec>
+      <option name="COMMAND" value="portbook" />
+      <option name="PARAMETERS" value="serve --open" />
+      <option name="WORKING_DIRECTORY" value="$ProjectFileDir$" />
+    </exec>
+  </tool>
+</toolSet>

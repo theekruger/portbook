@@ -1,0 +1,12 @@
+# Files excluded from the packaged .vsix (keep it to just what the extension host needs).
+.vscode/**
+.vscode-test/**
+.gitignore
+.vscodeignore
+**/*.vsix
+**/.DS_Store
+node_modules/**
+jsconfig.json
+**/tsconfig.json
+**/*.map
+test-extension.mjs

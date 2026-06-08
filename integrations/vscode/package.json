@@ -1,0 +1,74 @@
+{
+  "name": "portbook",
+  "displayName": "portbook",
+  "description": "View and reserve machine-wide ports from VS Code, Cursor, and Windsurf — backed by the portbook registry + ecosystem dashboard.",
+  "version": "0.1.0",
+  "publisher": "portbook",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/TheeKruger/portbook.git", "directory": "integrations/vscode" },
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Other"],
+  "keywords": ["ports", "registry", "devtools", "containers", "cursor", "windsurf"],
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "configuration": {
+      "title": "portbook",
+      "properties": {
+        "portbook.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:7800",
+          "description": "Base URL of the running `portbook serve` HTTP server."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "portbook",
+          "title": "portbook",
+          "icon": "$(plug)"
+        }
+      ]
+    },
+    "views": {
+      "portbook": [
+        {
+          "id": "portbookPorts",
+          "name": "Ports",
+          "icon": "$(plug)",
+          "contextualTitle": "portbook"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "portbook.refresh",
+        "title": "portbook: Refresh Ports",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "portbook.openDashboard",
+        "title": "portbook: Open Dashboard",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "portbook.reserve",
+        "title": "portbook: Reserve a Port",
+        "icon": "$(add)"
+      },
+      {
+        "command": "portbook.serve",
+        "title": "portbook: Start Server (portbook serve)",
+        "icon": "$(play)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "portbook.refresh", "when": "view == portbookPorts", "group": "navigation@1" },
+        { "command": "portbook.reserve", "when": "view == portbookPorts", "group": "navigation@2" },
+        { "command": "portbook.openDashboard", "when": "view == portbookPorts", "group": "navigation@3" }
+      ]
+    }
+  }
+}

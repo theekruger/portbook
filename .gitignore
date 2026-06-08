@@ -1,0 +1,8 @@
+node_modules/
+*.tmp
+*.log
+*.vsix
+.DS_Store
+
+# Local-only / private (never published): your real reserved-block notes + the Cloud business plan
+*.private.md

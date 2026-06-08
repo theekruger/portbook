@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>portbook</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212b; --line:#272c38; --fg:#e6e9ef; --dim:#8b93a7;
+    --managed:#3fb950; --container:#58a6ff; --unmanaged:#d29922; --ghost:#f85149; --accent:#7c5cff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; padding:18px 24px; border-bottom:1px solid var(--line); }
+  h1 { font-size:18px; margin:0; letter-spacing:.3px; }
+  h1 span { color:var(--accent); }
+  .machine { color:var(--dim); font-size:13px; }
+  .spacer { flex:1; }
+  .meta { color:var(--dim); font-size:12px; display:flex; gap:14px; align-items:center; }
+  main { padding:20px 24px; max-width:1100px; }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; }
+  .chip { background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:5px 12px; font-size:12px; color:var(--dim); }
+  .chip b { color:var(--fg); font-weight:600; }
+  section { margin-bottom:26px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.6px; color:var(--dim); margin:0 0 10px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  th,td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  th { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--dim); font-weight:600; }
+  tr:last-child td { border-bottom:none; }
+  td.port { font-weight:600; }
+  .tag { display:inline-block; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:600; }
+  .tag.managed { color:var(--managed); background:rgba(63,185,80,.12); }
+  .tag.container { color:var(--container); background:rgba(88,166,255,.12); }
+  .tag.unmanaged { color:var(--unmanaged); background:rgba(210,153,34,.12); }
+  .tag.ghost { color:var(--ghost); background:rgba(248,81,73,.12); }
+  .what b { font-weight:600; } .what .sub { color:var(--dim); font-size:12px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .card .name { font-weight:600; } .card .img { color:var(--dim); font-size:12px; margin-bottom:8px; }
+  .pm { font-size:12px; color:var(--fg); } .pm .arr { color:var(--dim); } .pm.int { color:var(--dim); }
+  button { font:inherit; font-size:12px; color:var(--fg); background:var(--panel2); border:1px solid var(--line); border-radius:7px; padding:5px 11px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  .row-actions { text-align:right; }
+  .empty { color:var(--dim); padding:14px; background:var(--panel); border:1px dashed var(--line); border-radius:10px; }
+  .note { color:var(--dim); font-size:12px; margin-top:6px; }
+  .dot { width:7px; height:7px; border-radius:50%; display:inline-block; margin-right:6px; }
+  .live { background:var(--managed); } .off { background:var(--dim); }
+  label.sw { display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>port<span>book</span></h1>
+  <span class="machine" id="machine">…</span>
+  <span class="spacer"></span>
+  <div class="meta">
+    <span id="runtimes"></span>
+    <label class="sw"><input type="checkbox" id="auto" checked /> auto-refresh</label>
+    <button id="gc">gc</button>
+    <span id="updated"></span>
+  </div>
+</header>
+<main>
+  <div class="chips" id="chips"></div>
+
+  <section>
+    <h2>Host ports — what's listening on this machine</h2>
+    <div id="hostWrap"></div>
+  </section>
+
+  <section>
+    <h2>Containers</h2>
+    <div id="containers"></div>
+  </section>
+
+  <section id="wslSection" hidden>
+    <h2>WSL distros</h2>
+    <div id="wsl"></div>
+    <div class="note">Ports <em>inside</em> a distro aren't visible from the host. Run a portbook reporter inside it to include them (fleet mode).</div>
+  </section>
+
+  <section id="fleetSection" hidden>
+    <h2>Fleet — machines sharing this registry</h2>
+    <div id="fleet"></div>
+  </section>
+
+  <section>
+    <h2>Ghosts — reserved, but nothing is listening</h2>
+    <div id="ghosts"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+async function api(path, opts) {
+  // If the server is token-protected, send a token from localStorage; on 401 prompt once and retry.
+  const t = localStorage.getItem("portbook_token");
+  const headers = Object.assign({}, opts && opts.headers, t ? { authorization: "Bearer " + t } : {});
+  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if (r.status === 401) {
+    const entered = window.prompt("This portbook server requires a token (PORTBOOK_TOKEN):");
+    if (!entered) throw new Error("unauthorized");
+    localStorage.setItem("portbook_token", entered);
+    return api(path, opts);
+  }
+  return r.json();
+}
+
+function chip(label, value) { return `<span class="chip">${esc(label)} <b>${esc(value)}</b></span>`; }
+
+function whatCell(p) {
+  if (p.container) return `<div class="what"><b>${esc(p.container.name)}</b> <span class="tag container">container</span><div class="sub">${esc(p.container.image)} · :${esc(p.container.containerPort)} via ${esc(p.container.runtime)}</div></div>`;
+  return `<div class="what"><b>${esc(p.proc || "—")}</b><div class="sub">pid ${esc(p.pid ?? "—")}</div></div>`;
+}
+function resCell(p) {
+  if (!p.reservation) return `<span class="dim">—</span>`;
+  const r = p.reservation;
+  return `<b>${esc(r.project)}</b>${r.owner ? ` <span class="what"><span class="sub">${esc(r.owner)}</span></span>` : ""}${r.purpose ? `<div class="what"><span class="sub">${esc(r.purpose)}</span></div>` : ""}`;
+}
+
+function render(e) {
+  $("machine").textContent = e.machine;
+  $("updated").textContent = "updated " + new Date(e.at).toLocaleTimeString();
+  const rt = e.runtimes || {};
+  $("runtimes").innerHTML = Object.keys(rt).map((k) => `<span class="dot ${rt[k] ? "live" : "off"}"></span>${esc(k)}`).join(" &nbsp; ");
+
+  const s = e.summary;
+  $("chips").innerHTML = [
+    chip("listening", s.listening), chip("managed", s.managed), chip("container", s.container),
+    chip("unmanaged", s.unmanaged), chip("ghosts", s.ghosts), chip("containers", s.containers),
+  ].join("");
+
+  // Host ports
+  if (!e.ports.length) $("hostWrap").innerHTML = `<div class="empty">No TCP listeners detected.</div>`;
+  else $("hostWrap").innerHTML = `<table><thead><tr><th>Port</th><th>What</th><th>Reservation</th><th>Kind</th></tr></thead><tbody>` +
+    e.ports.map((p) => `<tr><td class="port">${esc(p.port)}</td><td>${whatCell(p)}</td><td>${resCell(p)}</td><td><span class="tag ${esc(p.kind)}">${esc(p.kind)}</span></td></tr>`).join("") +
+    `</tbody></table>`;
+
+  // Containers
+  if (!e.containers.length) $("containers").innerHTML = `<div class="empty">No running containers (or no container runtime detected).</div>`;
+  else $("containers").innerHTML = `<div class="cards">` + e.containers.map((c) => {
+    const pub = c.ports.map((p) => `<div class="pm">${p.hostIp ? esc(p.hostIp) + ":" : ""}<b>${esc(p.hostPort)}</b> <span class="arr">→</span> :${esc(p.containerPort)}/${esc(p.proto)}</div>`).join("");
+    const int = c.internalPorts.map((p) => `<div class="pm int">:${esc(p.containerPort)}/${esc(p.proto)} <span class="arr">(internal)</span></div>`).join("");
+    return `<div class="card"><div class="name">${esc(c.name)}</div><div class="img">${esc(c.image)} · ${esc(c.status)}</div>${pub || int || '<div class="pm int">no ports</div>'}${pub ? int : ""}</div>`;
+  }).join("") + `</div>`;
+
+  // WSL
+  if (e.wsl && e.wsl.length) {
+    $("wslSection").hidden = false;
+    $("wsl").innerHTML = `<table><tbody>` + e.wsl.map((d) => `<tr><td><b>${esc(d.name)}</b>${d.default ? ' <span class="tag container">default</span>' : ""}</td><td>${esc(d.state)}</td><td>WSL ${esc(d.version)}</td></tr>`).join("") + `</tbody></table>`;
+  }
+
+  // Ghosts
+  if (!e.ghosts.length) $("ghosts").innerHTML = `<div class="empty">None — every reservation is actually listening.</div>`;
+  else $("ghosts").innerHTML = `<table><thead><tr><th>Port</th><th>Project</th><th>Purpose</th><th></th></tr></thead><tbody>` +
+    e.ghosts.map((g) => `<tr><td class="port">${esc(g.port)}</td><td><b>${esc(g.project)}</b></td><td class="what"><span class="sub">${esc(g.purpose || "")}</span></td><td class="row-actions"><button data-release="${esc(g.port)}"${g.machine ? ` data-machine="${esc(g.machine)}"` : ""}>release</button></td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
+async function refreshFleet(localMachine) {
+  let f; try { f = await api("/api/fleet"); } catch { return; }
+  const counts = {};
+  for (const r of f.reservations) counts[r.machine] = (counts[r.machine] || 0) + 1;
+  const names = [...new Set([...Object.keys(counts), ...Object.keys(f.reports || {})])];
+  if (names.length <= 1) { $("fleetSection").hidden = true; return; } // single machine — nothing to show
+  $("fleetSection").hidden = false;
+  const rows = names.sort().map((m) => {
+    const rep = (f.reports || {})[m];
+    const s = rep && rep.ecosystem && rep.ecosystem.summary;
+    const here = m === localMachine ? ' <span class="tag managed">this machine</span>' : "";
+    const reported = s ? `${esc(s.listening)} listening · ${esc(s.containers)} containers` : "not reported";
+    const seen = rep ? new Date(rep.at).toLocaleTimeString() : "—";
+    return `<tr><td><b>${esc(m)}</b>${here}</td><td>${esc(counts[m] || 0)} reserved</td><td class="what"><span class="sub">${reported}</span></td><td class="what"><span class="sub">${esc(seen)}</span></td></tr>`;
+  }).join("");
+  $("fleet").innerHTML = `<table><thead><tr><th>Machine</th><th>Reservations</th><th>Reported</th><th>Last report</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function refresh() {
+  try { const e = await api("/api/ecosystem"); render(e); refreshFleet(e.machine); }
+  catch (e) { $("updated").textContent = "error: " + e.message; }
+}
+
+document.addEventListener("click", async (ev) => {
+  const rel = ev.target.getAttribute && ev.target.getAttribute("data-release");
+  if (rel) {
+    // Scope the release to the ghost's own machine so in fleet mode we don't wipe that port on EVERY
+    // machine that holds it. Legacy rows without a machine fall back to the (single-machine) unscoped call.
+    const machine = ev.target.getAttribute("data-machine");
+    const payload = machine ? { port: Number(rel), machine } : { port: Number(rel) };
+    await api("/api/release", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload) });
+    refresh();
+  }
+});
+$("gc").onclick = async () => { await api("/api/gc", { method:"POST" }); refresh(); };
+
+let timer = null;
+function loop() { clearInterval(timer); if ($("auto").checked) timer = setInterval(refresh, 4000); }
+$("auto").onchange = loop;
+refresh(); loop();
+</script>
+</body>
+</html>

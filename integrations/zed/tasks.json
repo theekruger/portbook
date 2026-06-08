@@ -1,0 +1,32 @@
+[
+  {
+    "label": "portbook: list",
+    "command": "portbook list",
+    "use_new_terminal": false,
+    "reveal": "always"
+  },
+  {
+    "label": "portbook: scan",
+    "command": "portbook scan",
+    "use_new_terminal": false,
+    "reveal": "always"
+  },
+  {
+    "label": "portbook: env",
+    "command": "portbook env",
+    "use_new_terminal": false,
+    "reveal": "always"
+  },
+  {
+    "label": "portbook: serve",
+    "command": "portbook serve --open",
+    "use_new_terminal": true,
+    "reveal": "always"
+  },
+  {
+    "label": "portbook: reserve for this project",
+    "command": "portbook reserve --project \"$ZED_WORKTREE_NAME\" --count 1 --owner zed",
+    "use_new_terminal": false,
+    "reveal": "always"
+  }
+]
