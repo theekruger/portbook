@@ -128,3 +128,12 @@ Worth knowing before you lean on it:
 - **Optional managed hosting (later):** for people who'd rather not self-host the fleet server —
   zero-setup sync, encrypted backups, and an end-to-end-encrypted tier. Open-core done honestly: any
   paid layer is for *operations*, never features; self-hosting stays free and complete.
+
+## Support
+If portbook saves you from a port collision or two, you can support its development:
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/theekruger)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-ffdd00?logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/theekruger)
+
+It stays **zero-dependency, cross-platform, and free** either way — sponsorships just help keep it
+maintained. Thank you! ☕
