@@ -110,6 +110,21 @@ export async function gc() {
   return removed;
 }
 
+// Commit ONE pre-existing local reservation to the shared ledger verbatim (used by `portbook import`).
+// Unlike reserve(), this never auto-picks and never probes the OS: it migrates a record that already
+// exists locally, so it carries the reservation's OWN machine (fallback machineName()) and preserves
+// project/port/purpose/owner/pid. `adopt` follows the source status (an already-active hold re-registers
+// as active). The server still runs the authoritative per-machine conflict check under its lock — a
+// "already reserved on <machine>" rejection surfaces as-is for the caller to skip.
+export async function importReservation(r) {
+  const out = await post("/api/reserve", {
+    project: r.project, port: r.port, machine: r.machine || machineName(),
+    probe: false, adopt: r.status === "active",
+    purpose: r.purpose ?? null, owner: r.owner ?? null, pid: r.pid ?? null,
+  });
+  return Array.isArray(out) ? out[0] : out;
+}
+
 // Push this machine's full ecosystem (host ports + containers + WSL) to the server so the fleet view /
 // dashboard can show every machine — including what's inside it, which the server can't see itself.
 export async function report() {

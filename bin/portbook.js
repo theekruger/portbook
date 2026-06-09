@@ -32,6 +32,7 @@ Usage:
   portbook gc                                               # reclaim dead-PID / expired reservations
   portbook fleet                                            # all machines' reservations (needs PORTBOOK_SERVER)
   portbook report                                           # push this machine's ecosystem to the fleet server
+  portbook import [--json]                                  # migrate this machine's LOCAL reservations into the fleet server
   portbook where                                            # print the registry file path (or server URL in fleet mode)
 
 Fleet mode: set PORTBOOK_SERVER=http://<host>:7800 and reserve/release/list/check/gc coordinate
@@ -223,6 +224,22 @@ async function main() {
       if (!remote) throw new Error("fleet needs a fleet server — set PORTBOOK_SERVER=http://<host>:7800");
       const f = await remote.fleet();
       console.log(a.json ? JSON.stringify(f, null, 2) : fmtFleet(f));
+      return;
+    }
+    if (cmd === "import") {
+      if (!remote) throw new Error("import needs a fleet server — set PORTBOOK_SERVER=http://<host>:7800");
+      // Read THIS machine's local reservations (list() always reads the local ~/.portbook file — the
+      // client is a separate module) and commit each to the shared server verbatim. A per-port
+      // "already reserved on <machine>" conflict means it's already there → skip it, don't abort.
+      const local = list(); // local registry, regardless of $PORTBOOK_SERVER
+      const imported = [], skipped = [];
+      for (const r of local) {
+        try { imported.push(await remote.importReservation(r)); }
+        catch (e) { if (/already reserved on/.test(e?.message || "")) skipped.push(r); else throw e; }
+      }
+      const server = process.env.PORTBOOK_SERVER;
+      if (a.json) console.log(JSON.stringify({ server, imported, skipped: skipped.length }, null, 2));
+      else console.log(`imported ${imported.length} reservation(s) to ${server} (skipped ${skipped.length} already present)`);
       return;
     }
     console.error(`unknown command: ${cmd}\n`);

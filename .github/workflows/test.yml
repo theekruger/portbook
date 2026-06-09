@@ -1,0 +1,25 @@
+# Cross-platform test matrix. The headline value: portbook's listener enumeration
+# has OS-specific paths (PowerShell/netstat on Windows, ss/lsof on POSIX) that
+# only the matching runner can actually exercise — so we run the suite on all three.
+name: test
+
+# Quoted so strict YAML 1.1 parsers/linters don't coerce the `on` key to a boolean.
+"on": [push, pull_request]
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: [18, 20]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      # Zero runtime deps and no lockfile, so `npm ci`/`npm install` has nothing
+      # to do (and `npm ci` would fail without a lockfile) — go straight to tests.
+      - run: npm test

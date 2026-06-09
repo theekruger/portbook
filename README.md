@@ -1,5 +1,9 @@
 # portbook
 
+[![CI](https://github.com/theekruger/portbook/actions/workflows/test.yml/badge.svg)](https://github.com/theekruger/portbook/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
+
 A tiny, **machine-wide port reservation registry** so multiple dev servers — and multiple AI coding agents working in parallel — stop colliding on the same ports.
 
 > Built after an agent shuffled ports and silently killed another project's running servers. portbook is the shared source of truth that prevents that.
@@ -88,9 +92,35 @@ const eco = await ecosystem();              // host + containers + WSL, all cros
 Set `PORTBOOK_SERVER=http://<host>:7800` and a machine's `reserve`/`release`/`list`/`check`/`gc`
 coordinate against that shared `portbook serve` authority instead of its local file — so every machine
 shares one registry. Conflicts are **per-machine** (two machines can both use `5000`). `portbook report`
-pushes a machine's ecosystem up; `portbook fleet` shows who's on what, everywhere. Unset the env var and
-it's fully local again. Run the server bound to a Tailscale IP and only your tailnet can reach it.
+pushes a machine's ecosystem up; `portbook fleet` shows who's on what, everywhere; `portbook import`
+migrates a machine's existing local reservations into the shared server (skipping any already present),
+so you can adopt fleet mode without re-reserving by hand. Unset the env var and it's fully local again.
+Run the server bound to a Tailscale IP and only your tailnet can reach it.
 Details + the "reporter inside a VM" model: **[docs/FLEET.md](docs/FLEET.md)**.
+
+## Limitations
+Worth knowing before you lean on it:
+
+- **It's a cooperative convention, not enforcement.** portbook coordinates well-behaved servers and
+  agents; it does **not** stop a process from binding a free port it never reserved — the OS still
+  hands any port to anyone who asks. The value comes entirely from *everyone* on a machine actually
+  reserving first. One tool that hardcodes `3000` can still clobber a reservation. Treat `list`/`scan`
+  as the shared map, not a lock.
+- **OS & container detection is best-effort.** Liveness and ecosystem views shell out to the tools you
+  already have (`ss`/`lsof`/PowerShell/`netstat` for listeners; `docker`/`nerdctl`/`podman` and `wsl`
+  for sub-environments). Output formats vary by version and platform, and a tool that's absent, slow,
+  or behind a permission prompt simply reports nothing — these enumerations are guarded so they never
+  throw, but that means they can also under-report. The **registry** is always authoritative; the live
+  BOUND/scan columns are a best-effort overlay on top of it.
+- **Fleet mode is cooperative-trust.** The shared server believes the `machine` name and OS-free check
+  each client sends — it cannot verify another machine's identity or actually see inside its OS. So run
+  `portbook serve` on a **private** network only (e.g. a Tailscale IP via `--bind`), set
+  `PORTBOOK_TOKEN` for defense in depth, and never expose it to the public internet. It's the trust
+  model of any internal dev service, not an authenticated multi-tenant API.
+- **It's a young project.** The core is exercised by a test suite in CI across Linux, macOS, and
+  Windows, but it hasn't been battle-tested across a wide range of real-world setups yet. Edge cases in
+  shell output, container runtimes, and odd network stacks are exactly where bugs will hide — if you
+  hit one, please [open an issue](https://github.com/theekruger/portbook/issues).
 
 ## Roadmap
 - **OSS core (this) — free, forever:** the CLI + library + dashboard + MCP/editor integrations + the

@@ -204,6 +204,66 @@ export async function getListeners() {
   return posixListeners();
 }
 
+// ── OS listener-table parsers ────────────────────────────────────────────────────────────────────
+// Pure functions: each takes the raw text/JSON one tool emits and returns deduped [{port, pid, proc}]
+// (first occurrence of a port wins, matching how the OS lists the primary binding first). Kept apart
+// from the shell-out wrappers so they're unit-testable on any OS without the tool being installed.
+// The last segment after ":" is the port for every address form we see — IPv4 `127.0.0.1:6379`,
+// IPv6 `[::]:8080`, and wildcard `0.0.0.0:135` all end in `:<port>`.
+const portOf = (addr) => Number(String(addr).slice(String(addr).lastIndexOf(":") + 1));
+
+// `netstat -ano` (Windows). Lines look like: `  TCP    0.0.0.0:135    0.0.0.0:0    LISTENING    1032`.
+// Keep only TCP rows in LISTENING state; PID is the trailing column. No process name from netstat.
+export function parseNetstat(text) {
+  const out = new Map();
+  for (const line of String(text).split(/\r?\n/)) {
+    const t = line.trim().split(/\s+/);
+    if (t[0] !== "TCP" || !t.includes("LISTENING")) continue;
+    const port = portOf(t[1] || "");
+    const pid = Number(t[t.length - 1]);
+    if (port && !out.has(port)) out.set(port, { port, pid: pid || null, proc: null });
+  }
+  return [...out.values()];
+}
+
+// `ss -tlnpH` (Linux). Lines look like:
+//   `LISTEN 0 4096 127.0.0.1:6379 0.0.0.0:* users:(("redis-server",pid=1234,fd=6))`
+// Local address is column 4 (0-indexed 3); pid + process name come from the `users:((...))` field.
+export function parseSs(text) {
+  const out = new Map();
+  for (const line of String(text).split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const cols = line.trim().split(/\s+/);
+    const port = portOf(cols[3] || "");
+    const pidM = line.match(/pid=(\d+)/);
+    const procM = line.match(/\("([^"]+)"/);
+    if (port && !out.has(port)) out.set(port, { port, pid: pidM ? Number(pidM[1]) : null, proc: procM ? procM[1] : null });
+  }
+  return [...out.values()];
+}
+
+// `lsof -nP -iTCP -sTCP:LISTEN` (macOS/BSD). The first line is a header we skip. Lines look like:
+//   `node    4100 ctk   23u  IPv4 0x... 0t0 TCP 127.0.0.1:4100 (LISTEN)`
+// Command is column 0, PID column 1, the address (with port) column 8.
+export function parseLsof(text) {
+  const out = new Map();
+  for (const line of String(text).split(/\r?\n/).slice(1)) {
+    const c = line.trim().split(/\s+/);
+    if (c.length < 9) continue;
+    const port = portOf(c[8] || "");
+    if (port && !out.has(port)) out.set(port, { port, pid: Number(c[1]) || null, proc: c[0] || null });
+  }
+  return [...out.values()];
+}
+
+// Get-NetTCPConnection (Windows, preferred path) emits JSON — either a single object or an array of
+// `{ port, pid, proc }`. Parse the text, then normalize each row the same way the others produce.
+export function parsePowershell(text) {
+  const j = JSON.parse((String(text).trim() || "[]"));
+  const arr = Array.isArray(j) ? j : [j];
+  return arr.filter((x) => x && x.port).map((x) => ({ port: Number(x.port), pid: x.pid ?? null, proc: x.proc || null }));
+}
+
 async function winListeners() {
   // Prefer Get-NetTCPConnection (locale-independent, gives the owning PID directly); fall back to
   // parsing `netstat -ano` if PowerShell or the NetTCPIP module isn't available.
@@ -213,9 +273,7 @@ async function winListeners() {
     " [pscustomobject]@{ port=[int]$_.Name; pid=$o.OwningProcess; proc=$n } } | ConvertTo-Json -Compress";
   try {
     const { stdout } = await pexec("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps], { timeout: 12000, maxBuffer: 1 << 22 });
-    const j = JSON.parse((stdout.trim() || "[]"));
-    const arr = Array.isArray(j) ? j : [j];
-    return arr.filter((x) => x && x.port).map((x) => ({ port: Number(x.port), pid: x.pid ?? null, proc: x.proc || null }));
+    return parsePowershell(stdout);
   } catch {
     return netstatListeners();
   }
@@ -224,16 +282,7 @@ async function winListeners() {
 async function netstatListeners() {
   try {
     const { stdout } = await pexec("netstat", ["-ano"], { timeout: 12000, maxBuffer: 1 << 22 });
-    const out = new Map();
-    for (const line of stdout.split(/\r?\n/)) {
-      const t = line.trim().split(/\s+/);
-      if (t[0] !== "TCP" || !t.includes("LISTENING")) continue;
-      const local = t[1] || "";
-      const port = Number(local.slice(local.lastIndexOf(":") + 1));
-      const pid = Number(t[t.length - 1]);
-      if (port && !out.has(port)) out.set(port, { port, pid: pid || null, proc: null });
-    }
-    return [...out.values()];
+    return parseNetstat(stdout);
   } catch { return []; }
 }
 
@@ -241,29 +290,12 @@ async function posixListeners() {
   // Try `ss` (Linux), then `lsof` (macOS/BSD). Best-effort; either may be absent.
   try {
     const { stdout } = await pexec("ss", ["-tlnpH"], { timeout: 12000, maxBuffer: 1 << 22 });
-    const out = new Map();
-    for (const line of stdout.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      const cols = line.trim().split(/\s+/);
-      const local = cols[3] || "";
-      const port = Number(local.slice(local.lastIndexOf(":") + 1));
-      const pidM = line.match(/pid=(\d+)/);
-      const procM = line.match(/\("([^"]+)"/);
-      if (port && !out.has(port)) out.set(port, { port, pid: pidM ? Number(pidM[1]) : null, proc: procM ? procM[1] : null });
-    }
-    if (out.size) return [...out.values()];
+    const rows = parseSs(stdout);
+    if (rows.length) return rows;
   } catch { /* fall through to lsof */ }
   try {
     const { stdout } = await pexec("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], { timeout: 12000, maxBuffer: 1 << 22 });
-    const out = new Map();
-    for (const line of stdout.split(/\r?\n/).slice(1)) {
-      const c = line.trim().split(/\s+/);
-      if (c.length < 9) continue;
-      const addr = c[8] || "";
-      const port = Number(addr.slice(addr.lastIndexOf(":") + 1));
-      if (port && !out.has(port)) out.set(port, { port, pid: Number(c[1]) || null, proc: c[0] || null });
-    }
-    return [...out.values()];
+    return parseLsof(stdout);
   } catch { return []; }
 }
 
