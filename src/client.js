@@ -41,6 +41,7 @@ export async function reserve(opts = {}) {
   const adopt = !!opts.adopt;
   const port = opts.port != null ? Number(opts.port) : null;
   const count = opts.count || 1;
+  const explicitRange = opts.rangeStart != null || opts.rangeEnd != null;
   const rangeStart = opts.rangeStart || 4000;
   const rangeEnd = opts.rangeEnd || 4999;
 
@@ -65,13 +66,28 @@ export async function reserve(opts = {}) {
   // free port — but never swallow an OS-busy/other error. This keeps concurrent auto-pick yielding
   // distinct ports, matching local single-machine behavior.
   const taken = new Set((await get("/api/list?raw=1")).filter((r) => r.machine === machine).map((r) => r.port));
+  // Block-aware, mirroring the core: a FOREIGN block (another project's territory on THIS machine)
+  // is always skipped; and absent an explicit range, hunt WITHIN this project's own block span(s)
+  // (ascending) instead of the default 4000-4999. Your own block never blocks you.
+  const blocks = (await get("/api/blocks")).filter((b) => (b.machine || machine) === machine);
+  const foreignBlock = (p) => blocks.find((b) => b.project !== opts.project && b.rangeStart <= p && p <= b.rangeEnd);
+  const own = !explicitRange
+    ? blocks.filter((b) => b.project === opts.project).sort((a, b) => a.rangeStart - b.rangeStart)
+    : [];
+  const spans = own.length ? own.map((b) => [b.rangeStart, b.rangeEnd]) : [[rangeStart, rangeEnd]];
   const made = [];
-  for (let p = rangeStart; p <= rangeEnd && made.length < count; p++) {
-    if (taken.has(p) || !(await isPortFree(p, host))) continue;
-    try { made.push(await commit(p)); taken.add(p); }
-    catch (e) { if (isConflict(e)) { taken.add(p); continue; } throw e; }
+  outer: for (const [lo, hi] of spans) {
+    for (let p = lo; p <= hi && made.length < count; p++) {
+      if (foreignBlock(p) || taken.has(p) || !(await isPortFree(p, host))) continue;
+      try { made.push(await commit(p)); taken.add(p); }
+      catch (e) { if (isConflict(e)) { taken.add(p); continue; } throw e; }
+    }
+    if (made.length >= count) break outer;
   }
-  if (made.length < count) throw new Error(`could not find ${count} free port(s) in ${rangeStart}-${rangeEnd} on ${machine}`);
+  if (made.length < count) {
+    const where = own.length ? `"${opts.project}"'s block(s)` : `${rangeStart}-${rangeEnd}`;
+    throw new Error(`could not find ${count} free port(s) in ${where} on ${machine}`);
+  }
   return made;
 }
 
@@ -108,6 +124,35 @@ export async function gc() {
     if (expired || dead) { await post("/api/release", { id: r.id }); removed.push(r); }
   }
   return removed;
+}
+
+// ── Port TERRITORY blocks against the shared ledger. The server owns the authoritative per-machine
+// overlap check under its lock; the client just attaches THIS machine's identity. Blocks are
+// persistent (no OS probe, no pid/ttl), so there's no client-side OS work — unlike reserve/gc.
+export async function reserveBlock(opts = {}) {
+  return post("/api/blocks", { ...opts, machine: machineName() });
+}
+
+// Release block(s) scoped to THIS machine (port/project matches); `id` is global. Returns the count.
+export async function releaseBlock(opts = {}) {
+  const body = await post("/api/blocks/release", { ...opts, machine: machineName() });
+  return body.released ?? 0;
+}
+
+// Every territory block in the shared registry (all machines); ?project= filters server-side.
+export async function listBlocks(opts = {}) {
+  return get("/api/blocks" + (opts.project ? `?project=${encodeURIComponent(opts.project)}` : ""));
+}
+
+// Commit ONE pre-existing local block to the shared ledger verbatim (the block analogue of
+// importReservation, used by `portbook import`). Carries the block's OWN machine (fallback
+// machineName()) so a multi-machine registry migrates intact; the server still runs the per-machine
+// overlap check, so an overlap rejection surfaces as-is for the caller to skip.
+export async function importBlock(b) {
+  return post("/api/blocks", {
+    project: b.project, rangeStart: b.rangeStart, rangeEnd: b.rangeEnd,
+    owner: b.owner ?? null, purpose: b.purpose ?? null, machine: b.machine || machineName(),
+  });
 }
 
 // Commit ONE pre-existing local reservation to the shared ledger verbatim (used by `portbook import`).

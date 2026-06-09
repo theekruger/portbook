@@ -5,7 +5,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { reserve, release, gc, list, check, scan, annotate, machineName } from "./registry.js";
+import { reserve, release, gc, list, check, scan, annotate, machineName, reserveBlock, releaseBlock, listBlocks } from "./registry.js";
 import { ecosystem } from "./environments.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -64,11 +64,18 @@ export function createServer() {
       }
       if (req.method === "GET" && p.startsWith("/api/check/")) return send(res, 200, await check(Number(p.split("/").pop())));
       if (req.method === "GET" && p === "/api/fleet") {
-        return send(res, 200, { server: machineName(), at: new Date().toISOString(), reservations: list(), reports: Object.fromEntries(reports) });
+        return send(res, 200, { server: machineName(), at: new Date().toISOString(), reservations: list(), blocks: listBlocks(), reports: Object.fromEntries(reports) });
+      }
+      // Port TERRITORY blocks live in the same shared ledger; raw arrays (clients judge their own machine).
+      if (req.method === "GET" && p === "/api/blocks") {
+        const project = url.searchParams.get("project") || undefined;
+        return send(res, 200, listBlocks({ project }));
       }
 
       if (req.method === "POST" && p === "/api/reserve") return send(res, 200, await reserve(await readBody(req)));
       if (req.method === "POST" && p === "/api/release") return send(res, 200, { released: await release(await readBody(req)) });
+      if (req.method === "POST" && p === "/api/blocks") return send(res, 200, await reserveBlock(await readBody(req)));
+      if (req.method === "POST" && p === "/api/blocks/release") return send(res, 200, { released: await releaseBlock(await readBody(req)) });
       if (req.method === "POST" && p === "/api/gc") return send(res, 200, { reclaimed: (await gc()).length });
       if (req.method === "POST" && p === "/api/report") {
         const b = await readBody(req);

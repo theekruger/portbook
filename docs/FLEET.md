@@ -90,6 +90,16 @@ It exposes the current operations as JSON over HTTP:
 | `GET  /check/:port`  | `check()`      |                                                  |
 | `POST /gc`           | `gc()`         | TTL-based; per-machine PID liveness is client-reported |
 | `GET  /scan`         | aggregates     | each client POSTs its own `scan()`; server merges |
+| `GET  /blocks`       | `listBlocks()` | `?project=` to filter; port-territory blocks for every machine |
+| `POST /blocks`       | `reserveBlock()` | claim a range; body carries the client's `machine` |
+| `POST /blocks/release` | `releaseBlock()` |                                                |
+
+**Port-territory blocks are fleet-aware too.** A project's claimed range lives in the same shared
+ledger as reservations and is **machine-scoped** (a `machine` field, mirroring reservations — the same
+range on machine A and machine B don't collide). Clients read and write them over `GET`/`POST
+/api/blocks` (and `POST /api/blocks/release`), and `GET /api/fleet` returns every machine's blocks
+alongside its reservations. Because a block carries no PID or TTL it is **persistent** — the server
+never reconciles or `gc`s it; it stays until a `release`.
 
 **Client** — the CLI already shells through one set of functions; a single env var flips local↔remote:
 

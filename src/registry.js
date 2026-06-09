@@ -53,8 +53,9 @@ export function readRegistry() {
   try {
     const j = JSON.parse(fs.readFileSync(FILE, "utf8"));
     if (!Array.isArray(j.reservations)) j.reservations = [];
+    if (!Array.isArray(j.blocks)) j.blocks = [];
     return j;
-  } catch { return { version: 1, reservations: [] }; }
+  } catch { return { version: 1, reservations: [], blocks: [] }; }
 }
 export function writeRegistry(reg) {
   ensureDir();
@@ -99,6 +100,7 @@ export function reconcile(reg) {
 export async function reserve(opts = {}) {
   const { project, port, count = 1, purpose = null, owner = null, host = null, pid = null, ttlSec = null,
     machine = machineName(), probe = true } = opts;
+  const explicitRange = opts.rangeStart != null || opts.rangeEnd != null;
   const rangeStart = opts.rangeStart || 4000;
   const rangeEnd = opts.rangeEnd || 4999;
   if (!project) throw new Error("reserve requires a --project");
@@ -107,6 +109,11 @@ export async function reserve(opts = {}) {
   return withLock(async () => {
     const reg = readRegistry();
     reconcile(reg);
+    const blocks = reg.blocks || [];
+    // A port is in a FOREIGN block when another project owns a block on THIS machine that spans it.
+    // Your own project's block never blocks you (that's the whole point of reserving territory).
+    const foreignBlock = (p) =>
+      blocks.find((b) => (b.machine || machine) === machine && b.project !== project && b.rangeStart <= p && p <= b.rangeEnd);
     // Conflicts are PER MACHINE: port 5000 on machine A and on machine B don't collide. `probe` runs the
     // OS-free check locally; a fleet client sets probe:false because it already checked on its own machine.
     const taken = new Map(reg.reservations.map((r) => [`${r.machine}:${r.port}`, r]));
@@ -114,16 +121,32 @@ export async function reserve(opts = {}) {
     const chosen = [];
     if (port != null) {
       if (taken.has(key(port))) throw new Error(`port ${port} is already reserved on ${machine} by "${taken.get(key(port)).project}"`);
+      const fb = foreignBlock(port);
+      if (fb) throw new Error(`port ${port} is inside "${fb.project}"'s reserved block ${fb.rangeStart}-${fb.rangeEnd}`);
       // `adopt` registers a port you ALREADY run on (skips the free check). Otherwise it must be free.
       if (probe && !opts.adopt && !(await isPortFree(port, host))) {
         throw new Error(`port ${port} is in use at the OS level. Use --adopt if this is your own running service.`);
       }
       chosen.push(port);
     } else {
-      for (let p = rangeStart; p <= rangeEnd && chosen.length < count; p++) {
-        if (!taken.has(key(p)) && (!probe || (await isPortFree(p, host)))) chosen.push(p);
+      // Auto-pick. If the caller didn't ask for an explicit range and this project owns block(s) on
+      // this machine, hunt WITHIN its own territory (ascending) instead of the default 4000-4999.
+      const own = !explicitRange
+        ? blocks.filter((b) => (b.machine || machine) === machine && b.project === project)
+            .sort((a, b) => a.rangeStart - b.rangeStart)
+        : [];
+      const spans = own.length ? own.map((b) => [b.rangeStart, b.rangeEnd]) : [[rangeStart, rangeEnd]];
+      outer: for (const [lo, hi] of spans) {
+        for (let p = lo; p <= hi && chosen.length < count; p++) {
+          if (foreignBlock(p)) continue;
+          if (!taken.has(key(p)) && (!probe || (await isPortFree(p, host)))) chosen.push(p);
+        }
+        if (chosen.length >= count) break outer;
       }
-      if (chosen.length < count) throw new Error(`could not find ${count} free port(s) in ${rangeStart}-${rangeEnd}`);
+      if (chosen.length < count) {
+        const where = own.length ? `"${project}"'s block(s)` : `${rangeStart}-${rangeEnd}`;
+        throw new Error(`could not find ${count} free port(s) in ${where}`);
+      }
     }
     const expiresAt = ttlSec ? new Date(Date.now() + ttlSec * 1000).toISOString() : null;
     const made = chosen.map((p) => ({
@@ -151,6 +174,66 @@ export async function release(opts = {}) {
     writeRegistry(reg);
     return before - reg.reservations.length;
   });
+}
+
+// ── Port TERRITORY: a project claims a contiguous range it owns, so its own auto-picks land inside it
+// and everyone else is steered away. Blocks are PERSISTENT (no pid/ttl — never reconciled or gc'd);
+// conflicts are PER MACHINE, mirroring reservations. A missing .machine is treated as this machine.
+export async function reserveBlock(opts = {}) {
+  const { project, rangeStart, rangeEnd, owner = null, purpose = null, machine = machineName() } = opts;
+  if (!project) throw new Error("reserveBlock requires a --project");
+  if (!validPort(rangeStart) || !validPort(rangeEnd) || rangeStart > rangeEnd) {
+    throw new Error(`invalid block range ${rangeStart}-${rangeEnd} — need 1-65535 with start <= end`);
+  }
+  return withLock(async () => {
+    const reg = readRegistry();
+    reconcile(reg);
+    const here = (m) => (m || machine) === machine; // missing machine == this machine
+    // (a) No overlap with ANOTHER project's block on this machine (your own block overlapping is fine).
+    for (const b of reg.blocks) {
+      if (!here(b.machine) || b.project === project) continue;
+      if (rangeStart <= b.rangeEnd && b.rangeStart <= rangeEnd) {
+        throw new Error(`range ${rangeStart}-${rangeEnd} overlaps "${b.project}"'s block ${b.rangeStart}-${b.rangeEnd}`);
+      }
+    }
+    // (b) Don't swallow another project's individual port reservation on this machine.
+    for (const r of reg.reservations) {
+      if (!here(r.machine) || r.project === project) continue;
+      if (r.port >= rangeStart && r.port <= rangeEnd) {
+        throw new Error(`range ${rangeStart}-${rangeEnd} contains "${r.project}"'s reservation on port ${r.port}`);
+      }
+    }
+    const block = { id: uid(), project, rangeStart, rangeEnd, owner, purpose, machine, reservedAt: nowISO() };
+    reg.blocks.push(block);
+    writeRegistry(reg);
+    return block;
+  });
+}
+
+export async function releaseBlock(opts = {}) {
+  const { id, project, machine } = opts;
+  if (!id && !project) throw new Error("releaseBlock requires --id or --project");
+  return withLock(async () => {
+    const reg = readRegistry();
+    const before = reg.blocks.length;
+    reg.blocks = reg.blocks.filter(
+      (b) => !((id && b.id === id) || (project && b.project === project && (!machine || b.machine === machine)))
+    );
+    writeRegistry(reg);
+    return before - reg.blocks.length;
+  });
+}
+
+export function listBlocks(opts = {}) {
+  const reg = readRegistry();
+  let rows = reg.blocks.slice().sort((a, b) => a.rangeStart - b.rangeStart);
+  if (opts.project) rows = rows.filter((b) => b.project === opts.project);
+  return rows;
+}
+
+// The block on `machine` (a missing block-machine matches) whose range spans `port`, else null.
+export function blockAt(blocks, port, machine) {
+  return blocks.find((b) => (b.machine || machine) === machine && b.rangeStart <= port && port <= b.rangeEnd) || null;
 }
 
 export async function gc() {

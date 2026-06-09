@@ -21,6 +21,8 @@ npm link        # puts `portbook` on your PATH (no dependencies; Node >= 18)
 ```bash
 portbook reserve --project webapp --port 4100 --purpose "api origin" --owner claude
 portbook reserve --project api --count 1 --range 4200-4299   # auto-pick a free one
+portbook block --project api --range 4200-4299               # claim a range as your territory
+portbook adopt 5432 --project db --purpose "postgres"        # register a port you already run on
 portbook check 4100
 portbook list                                # reserved ports + live BOUND state (yes/no/stale)
 portbook scan --range 4000-9000              # what's ACTUALLY listening; flags unmanaged ports
@@ -44,6 +46,53 @@ portbook list --json | jq '.[] | select(.bound==false)'   # reserved but not act
 service bound only to a specific interface (e.g. a Tailscale IP) still shows `yes`. `scan` goes
 further and shows *everything* listening on the machine — including ports **not** in portbook — so
 you can see your whole port picture at a glance and spot collisions before they happen.
+
+> **Reservations are permanent by default.** A plain `reserve` lives until you `release` it — it is
+> *never* auto-reclaimed. What makes a hold *ephemeral* (auto-freed by `gc` / the next `reserve`) is
+> attaching a lifetime: `--pid <serverPid>` frees it when that process dies, and `--ttl <seconds>`
+> frees it when the clock runs out. A reservation with **neither** a PID nor a TTL is permanent — use
+> that for a project's long-lived origins, and a PID/TTL for throwaway or agent-spawned servers so a
+> crash can't leak the port.
+
+## Port territory (blocks)
+Reserving one port at a time works, but for a project with several long-lived services it's cleaner
+to claim a whole **range as territory** up front, then let portbook hand out ports inside it:
+
+```bash
+portbook block --project api --range 4200-4299    # claim 4200–4299 for "api"
+portbook reserve --project api --count 1          # auto-picks INSIDE 4200–4299 (its own block)
+portbook reserve --project web --count 1          # some OTHER project auto-picks AROUND that block
+```
+
+A block does two things, both per-project and **per machine**:
+
+- **It's fenced off from everyone else.** Trying to grab a specific port inside another project's
+  block fails loudly: `portbook reserve --project web --port 4250` → rejected because `4250` is inside
+  `"api"`'s reserved block. Claiming a range that **overlaps** another project's block — or that would
+  swallow another project's existing single-port reservation — is rejected the same way.
+- **It steers your own auto-picks home.** When a project owns a block, its own `reserve --count N`
+  (with no explicit `--range`) draws ports **from within that block** instead of the default
+  `4000–4999`. Any *other* project's auto-pick skips over your block entirely. So two projects with
+  adjacent blocks never drift into each other's range.
+
+Blocks are **persistent** — they have no PID or TTL, so `gc` and reconciliation never reclaim them;
+release one explicitly with `portbook release --project api --blocks` (or `--block <id>`). List them
+with `portbook blocks` (or `portbook block --project api` for one project's). Your own project's block
+never blocks *you* — overlapping or reserving inside your own territory is always fine; that's the
+whole point of claiming it.
+
+### Adopting an existing port
+Sometimes a port is already in use by something portbook didn't reserve — a database, a system
+daemon, a server you started by hand. Two commands handle that:
+
+- **`portbook scan`** is how you *find* them: it lists every listener on the machine and tags each one
+  `managed` (in portbook) or **UNMANAGED** (listening but unreserved) so you can triage what's running
+  outside the registry.
+- **`portbook adopt <port> --project <name> [--purpose "..."]`** is how you *claim* one: it registers
+  a port you're **already** running on, skipping the normal "is this port free?" check (a plain
+  `reserve --port` on an occupied port fails on purpose). The hold is recorded as `active` and, like
+  any reservation, is permanent until you `release` it. (`portbook reserve --port <p> --adopt` is the
+  same operation spelled as a flag.)
 
 ### Ecosystem view & dashboard
 `portbook env` widens the lens to your whole machine: host listeners **plus** the containers running

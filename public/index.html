@@ -68,6 +68,11 @@
     <div id="hostWrap"></div>
   </section>
 
+  <section id="blocksSection" hidden>
+    <h2>Blocks — project port territories</h2>
+    <div id="blocks"></div>
+  </section>
+
   <section>
     <h2>Containers</h2>
     <div id="containers"></div>
@@ -93,6 +98,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+let blocks = []; // project port territories from /api/blocks (machine-scoped)
 
 async function api(path, opts) {
   // If the server is token-protected, send a token from localStorage; on 401 prompt once and retry.
@@ -119,6 +125,10 @@ function resCell(p) {
   const r = p.reservation;
   return `<b>${esc(r.project)}</b>${r.owner ? ` <span class="what"><span class="sub">${esc(r.owner)}</span></span>` : ""}${r.purpose ? `<div class="what"><span class="sub">${esc(r.purpose)}</span></div>` : ""}`;
 }
+// Which project territory (if any) a port falls inside. Blocks are machine-scoped; match the host's machine.
+function blockFor(port, machine) {
+  return blocks.find((b) => b.rangeStart <= port && port <= b.rangeEnd && (!b.machine || b.machine === machine));
+}
 
 function render(e) {
   $("machine").textContent = e.machine;
@@ -135,7 +145,8 @@ function render(e) {
   // Host ports
   if (!e.ports.length) $("hostWrap").innerHTML = `<div class="empty">No TCP listeners detected.</div>`;
   else $("hostWrap").innerHTML = `<table><thead><tr><th>Port</th><th>What</th><th>Reservation</th><th>Kind</th></tr></thead><tbody>` +
-    e.ports.map((p) => `<tr><td class="port">${esc(p.port)}</td><td>${whatCell(p)}</td><td>${resCell(p)}</td><td><span class="tag ${esc(p.kind)}">${esc(p.kind)}</span></td></tr>`).join("") +
+    e.ports.map((p) => { const b = blockFor(p.port, e.machine); const hint = b ? `<div class="sub">block: ${esc(b.project)}</div>` : "";
+      return `<tr><td class="port">${esc(p.port)}</td><td><div class="what">${whatCell(p)}${hint}</div></td><td>${resCell(p)}</td><td><span class="tag ${esc(p.kind)}">${esc(p.kind)}</span></td></tr>`; }).join("") +
     `</tbody></table>`;
 
   // Containers
@@ -177,8 +188,20 @@ async function refreshFleet(localMachine) {
   $("fleet").innerHTML = `<table><thead><tr><th>Machine</th><th>Reservations</th><th>Reported</th><th>Last report</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+function renderBlocks(machine) {
+  // Show only territories relevant to this host's machine (or machine-agnostic ones).
+  const rows = blocks.filter((b) => !b.machine || b.machine === machine);
+  if (!rows.length) { $("blocksSection").hidden = true; return; }
+  $("blocksSection").hidden = false;
+  $("blocks").innerHTML = `<table><thead><tr><th>Project</th><th>Range</th><th>Owner</th><th>Purpose</th></tr></thead><tbody>` +
+    rows.map((b) => `<tr><td><b>${esc(b.project)}</b></td><td class="port">${esc(b.rangeStart)}–${esc(b.rangeEnd)}</td><td class="what"><span class="sub">${esc(b.owner || "")}</span></td><td class="what"><span class="sub">${esc(b.purpose || "")}</span></td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
 async function refresh() {
-  try { const e = await api("/api/ecosystem"); render(e); refreshFleet(e.machine); }
+  // Load blocks first so host-port rows can show their territory hint; tolerate a missing endpoint.
+  try { const b = await api("/api/blocks"); blocks = Array.isArray(b) ? b : []; } catch { blocks = []; }
+  try { const e = await api("/api/ecosystem"); render(e); renderBlocks(e.machine); refreshFleet(e.machine); }
   catch (e) { $("updated").textContent = "error: " + e.message; }
 }
 

@@ -5,6 +5,37 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-08
+
+Port **territory** — projects can now claim a whole range, not just one port at a time — plus
+sharper ergonomics for ports that already exist outside the registry. Still **zero runtime
+dependencies** (Node built-ins only, ESM, Node >= 18).
+
+### Added
+- **Port-territory blocks** (`reserveBlock`/`releaseBlock`/`listBlocks` in `src/registry.js`) — a
+  project claims a contiguous range it owns: `portbook block --project <p> --range <a-b>`. Reserving a
+  specific port inside *another* project's block is rejected, and a block that overlaps another
+  project's block (or would swallow its existing single-port reservation) is rejected too. Conflicts
+  are **per machine**, mirroring reservations. Blocks are **persistent** — they carry no PID or TTL, so
+  `gc`/reconciliation never reclaim them; `portbook release --project <p> --blocks` (or `--block <id>`)
+  removes one. Surfaced in the fleet server (`GET`/`POST /api/blocks`, `POST /api/blocks/release`) and
+  in `GET /api/fleet`.
+- **Block-aware auto-pick** — `reserve --count N` (with no explicit `--range`) now draws ports from
+  *within* the requesting project's own block(s), and every *other* project's auto-pick is steered
+  around them, so adjacent projects stop drifting into each other's range.
+- **`adopt` for external ports** — register a port you're **already** running on (a DB, a hand-started
+  server) without the usual OS-free check: `portbook adopt <port> --project <name>` (also spelled
+  `portbook reserve --port <p> --adopt`). The hold is recorded as `active`. Pairs with `portbook scan`,
+  which tags every listener `managed` or **UNMANAGED** so you can find what to adopt.
+
+### Documentation
+- **Clarified that reservations are permanent by default** — a plain `reserve` lives until you
+  `release` it and is never auto-reclaimed; `--pid` and `--ttl` are what make a hold *ephemeral*
+  (auto-freed on process death / expiry). Documented across the README, `AGENTS.md`, and `docs/FLEET.md`
+  alongside the new territory model.
+
+[0.4.0]: https://github.com/theekruger/portbook/releases/tag/v0.4.0
+
 ## [0.3.0] - 2026-06-08
 
 The first public release. portbook grew from a single-machine reservation file into a full

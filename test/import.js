@@ -53,6 +53,10 @@ async function run() {
   const seedB = (await registry.reserve({ project: "beta", port: 47711, adopt: true }))[0];
   ok("two local reservations seeded", registry.list().length === 2 && seedA.port === 47710 && seedB.port === 47711);
 
+  // Seed a LOCAL territory block too — this is the part `portbook import` used to silently drop.
+  const seedBlock = await registry.reserveBlock({ project: "alpha", rangeStart: 47720, rangeEnd: 47729, owner: "smoke", purpose: "territory" });
+  ok("a local territory block seeded", registry.listBlocks().length === 1 && seedBlock.rangeStart === 47720 && seedBlock.rangeEnd === 47729);
+
   // Enter fleet mode and run the import loop exactly as the CLI does: local list() + importReservation,
   // skipping per-port conflicts.
   process.env.PORTBOOK_SERVER = SERVER;
@@ -63,7 +67,18 @@ async function run() {
       try { imported.push(await client.importReservation(r)); }
       catch (e) { if (/already reserved on/.test(e?.message || "")) skipped.push(r); else throw e; }
     }
-    return { imported, skipped };
+    // Blocks too — mirror bin/portbook.js's import branch: dedupe against the server, skip overlap/contains.
+    const localBlocks = registry.listBlocks();
+    const onServerBlocks = localBlocks.length ? await client.listBlocks({}) : [];
+    const me = registry.machineName();
+    const present = (b) => onServerBlocks.some((s) => (s.machine || me) === me && s.project === b.project && s.rangeStart === b.rangeStart && s.rangeEnd === b.rangeEnd);
+    const blocksImported = [], blocksSkipped = [];
+    for (const b of localBlocks) {
+      if (present(b)) { blocksSkipped.push(b); continue; }
+      try { blocksImported.push(await client.importBlock(b)); }
+      catch (e) { if (/overlaps|contains/.test(e?.message || "")) blocksSkipped.push(b); else throw e; }
+    }
+    return { imported, skipped, blocksImported, blocksSkipped };
   };
 
   const first = await doImport();
@@ -79,10 +94,20 @@ async function run() {
     byPort(47710)?.machine === registry.machineName() && byPort(47711)?.machine === registry.machineName());
   ok("an adopted (active) source registers active on the server", byPort(47710)?.status === "active");
 
+  // The block migrated too (the bug this test guards against): it must arrive on the server.
+  ok("first import also migrated the territory block", first.blocksImported.length === 1 && first.blocksSkipped.length === 0);
+  const serverBlocks = await (await fetch(SERVER + "/api/blocks")).json();
+  ok("server now holds the block with fields + machine preserved",
+    serverBlocks.length === 1 && serverBlocks[0].project === "alpha" &&
+    serverBlocks[0].rangeStart === 47720 && serverBlocks[0].rangeEnd === 47729 &&
+    serverBlocks[0].machine === registry.machineName());
+
   // A second import is idempotent: same machine + same ports → per-machine conflict → all skipped.
   const second = await doImport();
   ok("re-run skips both (already present), imports nothing", second.imported.length === 0 && second.skipped.length === 2);
   ok("server still holds exactly 2 (no duplicates)", (await (await fetch(SERVER + "/api/list?raw=1")).json()).length === 2);
+  ok("re-run skips the block too (idempotent)", second.blocksImported.length === 0 && second.blocksSkipped.length === 1);
+  ok("server still holds exactly 1 block (no duplicates)", (await (await fetch(SERVER + "/api/blocks")).json()).length === 1);
 
   // The CLI guards fleet mode: without PORTBOOK_SERVER, `portbook import` must error clearly.
   const noFleet = await new Promise((resolve) => {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { reserve, release, list, check, gc, scan, annotate, machineName, FILE } from "../src/registry.js";
+import { reserve, release, list, check, gc, scan, annotate, machineName, FILE, reserveBlock, releaseBlock, listBlocks, blockAt } from "../src/registry.js";
 import { ecosystem } from "../src/environments.js";
 
 function parseArgs(argv) {
@@ -23,6 +23,10 @@ Usage:
   portbook reserve --project <name> [--port <p> | --count <n>] [--range <a-b>]
                    [--purpose "..."] [--owner <agent>] [--pid <pid>] [--ttl <seconds>] [--adopt] [--json]
   portbook release (--project <name> | --port <p> | --id <id>)
+  portbook release (--block <id> | --project <name> --blocks)  # release reserved port block(s)
+  portbook adopt <port> [--project <p>] [--owner <o>] [--purpose "..."]  # claim a running OS/external port
+  portbook block --project <name> --range <a-b> [--owner <o>] [--purpose "..."]  # claim a port territory
+  portbook block --project <name> | portbook blocks [--json]   # list reserved port blocks
   portbook list [--project <name>] [--json] [--no-probe]    # reserved ports + live OS state
   portbook scan [--range <a-b>] [--json]                    # what's ACTUALLY listening on this machine
   portbook env [--json]                                     # full ecosystem: host + containers + WSL
@@ -41,6 +45,8 @@ against that shared server; PORTBOOK_MACHINE overrides this machine's name. See 
 Examples:
   portbook reserve --project webapp --port 4100 --purpose "api origin" --owner claude
   PORT=$(portbook reserve --project api --count 1 --range 4200-4299)
+  portbook block --project api --range 4200-4299            # claim a range; api's auto-picks land here
+  portbook adopt 5432 --project postgres                    # register a service already on this port
   portbook env                                              # containers labeled by name/image
   portbook serve --open                                     # open the dashboard in your browser
   portbook scan --range 4000-9000`;
@@ -66,29 +72,49 @@ function fmt(rows) {
   return [head, ...lines, ...(notes.length ? ["", ...notes.map((n) => "• " + n)] : [])].join("\n");
 }
 
+// Render a block table (PROJECT, RANGE 'a–b', OWNER, PURPOSE) — MACHINE column only across machines.
+function fmtBlocks(rows) {
+  if (!rows.length) return "(no port blocks)";
+  const pad = (s, n) => String(s ?? "").padEnd(n);
+  const multi = new Set(rows.map((b) => b.machine).filter(Boolean)).size > 1;
+  const mcol = multi ? `${pad("MACHINE", 16)} ` : "";
+  const mval = (b) => (multi ? `${pad((b.machine || "-").slice(0, 16), 16)} ` : "");
+  const head = `${pad("PROJECT", 16)} ${mcol}${pad("RANGE", 13)} ${pad("OWNER", 12)} PURPOSE`;
+  const lines = rows.map(
+    (b) => `${pad(b.project, 16)} ${mval(b)}${pad(`${b.rangeStart}–${b.rangeEnd}`, 13)} ${pad((b.owner || "-").slice(0, 12), 12)} ${b.purpose || ""}`
+  );
+  return [head, ...lines].join("\n");
+}
+
 // Render `portbook fleet` — reservations grouped by machine + what each machine last reported.
 function fmtFleet(f) {
   const pad = (s, n) => String(s ?? "").padEnd(n);
   const byMachine = new Map();
   for (const r of f.reservations) { if (!byMachine.has(r.machine)) byMachine.set(r.machine, []); byMachine.get(r.machine).push(r); }
+  const blocksByMachine = new Map();
+  for (const b of (f.blocks || [])) { if (!blocksByMachine.has(b.machine)) blocksByMachine.set(b.machine, []); blocksByMachine.get(b.machine).push(b); }
   const reports = f.reports || {};
-  const machines = [...new Set([...byMachine.keys(), ...Object.keys(reports)])].sort();
+  const machines = [...new Set([...byMachine.keys(), ...blocksByMachine.keys(), ...Object.keys(reports)])].sort();
   const L = [`fleet server: ${f.server}    ${machines.length} machine(s)`, ""];
   if (!machines.length) return L.concat("(no machines yet — run `portbook report` / reserve from a client)").join("\n");
   for (const m of machines) {
     const rs = (byMachine.get(m) || []).sort((a, b) => a.port - b.port);
+    const bs = (blocksByMachine.get(m) || []).sort((a, b) => a.rangeStart - b.rangeStart);
     const rep = reports[m];
     const repNote = rep ? ` — reported ${rep.ecosystem?.summary?.containers ?? 0} container(s) @ ${new Date(rep.at).toLocaleTimeString()}` : "";
-    L.push(`${m}  (${rs.length} reservation(s))${repNote}`);
+    L.push(`${m}  (${rs.length} reservation(s), ${bs.length} block(s))${repNote}`);
+    for (const b of bs) L.push(`  block ${pad(`${b.rangeStart}–${b.rangeEnd}`, 13)} ${b.project}${b.purpose ? ` — ${b.purpose}` : ""}`);
     for (const r of rs) L.push(`  ${pad(r.port, 6)} ${pad(r.project, 16)} ${r.purpose || ""}`);
   }
   return L.join("\n");
 }
 
-function fmtScan(res, inRange) {
+function fmtScan(res, inRange, blocks = []) {
   const pad = (s, n) => String(s ?? "").padEnd(n);
   const byPort = (a, b) => a.port - b.port;
-  const row = (port, pid, proc, tag) => `${pad(port, 6)} ${pad(pid ?? "-", 8)} ${pad((proc || "-").slice(0, 20), 20)} ${tag}`;
+  // Tag a port with the block (on this machine) whose range owns it, if any.
+  const blk = (port) => { const b = blockAt(blocks, port, res.machine); return b ? ` [block: ${b.project} ${b.rangeStart}–${b.rangeEnd}]` : ""; };
+  const row = (port, pid, proc, tag) => `${pad(port, 6)} ${pad(pid ?? "-", 8)} ${pad((proc || "-").slice(0, 20), 20)} ${tag}${blk(port)}`;
   const managed = res.managed.filter((l) => inRange(l.port)).sort(byPort);
   const unmanaged = res.unmanaged.filter((l) => inRange(l.port)).sort(byPort);
   const ghosts = res.ghosts.filter((r) => inRange(r.port)).sort(byPort);
@@ -102,7 +128,7 @@ function fmtScan(res, inRange) {
   for (const l of unmanaged) lines.push(row(l.port, l.pid, l.proc, "UNMANAGED — not in portbook"));
   if (ghosts.length) {
     lines.push("", `GHOSTS (${ghosts.length}) — reserved but nothing is listening:`);
-    for (const r of ghosts) lines.push(`${pad(r.port, 6)} ${pad(r.pid ?? "-", 8)} ${pad("-", 20)} reserved by ${r.project}`);
+    for (const r of ghosts) lines.push(`${pad(r.port, 6)} ${pad(r.pid ?? "-", 8)} ${pad("-", 20)} reserved by ${r.project}${blk(r.port)}`);
   }
   return lines.join("\n");
 }
@@ -158,7 +184,7 @@ async function main() {
   // Fleet mode: when $PORTBOOK_SERVER is set, ledger ops (reserve/release/list/check/gc) go to the
   // shared server; scan/env/serve stay local (they describe THIS machine). See docs/FLEET.md.
   const remote = process.env.PORTBOOK_SERVER ? await import("../src/client.js") : null;
-  const reg = remote || { reserve, release, list, check, gc };
+  const reg = remote || { reserve, release, list, check, gc, reserveBlock, releaseBlock, listBlocks };
   try {
     if (!cmd || cmd === "help" || a.help) { console.log(HELP); return; }
     if (cmd === "where") { console.log(remote ? process.env.PORTBOOK_SERVER : FILE); return; }
@@ -173,18 +199,72 @@ async function main() {
       console.log(a.json ? JSON.stringify(made, null, 2) : made.map((m) => m.port).join("\n"));
       return;
     }
-    if (cmd === "release") { const n = await reg.release({ project: a.project, port: num(a.port), id: a.id }); console.log(`released ${n} reservation(s)`); return; }
+    if (cmd === "adopt") {
+      // Claim a port already taken by an OS/external process. Default project to that process's name
+      // (from scan()) and owner to "external" when the caller doesn't override either.
+      const port = num(argv[1]) ?? num(a.port);
+      if (!port) throw new Error("adopt requires a port, e.g. `portbook adopt 5432 --project postgres`");
+      let project = typeof a.project === "string" ? a.project : null;
+      if (!project) {
+        const res = await scan();
+        const hit = res.listeners.find((l) => l.port === port);
+        project = (hit && hit.proc) || `port-${port}`;
+      }
+      const made = await reg.reserve({
+        project, port, adopt: true,
+        purpose: typeof a.purpose === "string" ? a.purpose : null,
+        owner: typeof a.owner === "string" ? a.owner : "external",
+        pid: num(a.pid), ttlSec: num(a.ttl),
+      });
+      console.log(a.json ? JSON.stringify(made, null, 2) : made.map((m) => m.port).join("\n"));
+      return;
+    }
+    if (cmd === "block") {
+      if (a.range) {
+        const [rangeStart, rangeEnd] = parseRange(a.range);
+        const block = await reg.reserveBlock({
+          project: a.project, rangeStart, rangeEnd,
+          owner: typeof a.owner === "string" ? a.owner : null,
+          purpose: typeof a.purpose === "string" ? a.purpose : null,
+        });
+        console.log(a.json ? JSON.stringify(block, null, 2) : fmtBlocks([block]));
+        return;
+      }
+      const rows = await reg.listBlocks({ project: a.project }); // no --range → list this project's blocks
+      console.log(a.json ? JSON.stringify(rows, null, 2) : fmtBlocks(rows));
+      return;
+    }
+    if (cmd === "blocks") {
+      const rows = await reg.listBlocks({ project: a.project });
+      console.log(a.json ? JSON.stringify(rows, null, 2) : fmtBlocks(rows));
+      return;
+    }
+    if (cmd === "release") {
+      if (a.block || a.blocks) {
+        const n = await reg.releaseBlock({ id: typeof a.block === "string" ? a.block : undefined, project: a.project });
+        console.log(`released ${n} block(s)`);
+        return;
+      }
+      const n = await reg.release({ project: a.project, port: num(a.port), id: a.id });
+      console.log(`released ${n} reservation(s)`);
+      return;
+    }
     if (cmd === "list") {
       const rows = await reg.list({ project: a.project }); // await: local list() is sync, remote is async
       const annotated = a["no-probe"] ? rows.map((r) => ({ ...r, bound: null, stale: null })) : await annotate(rows);
-      console.log(a.json ? JSON.stringify(annotated, null, 2) : fmt(annotated));
+      const blocks = await reg.listBlocks({ project: a.project });
+      if (a.json) { console.log(JSON.stringify(blocks.length ? { reservations: annotated, blocks } : annotated, null, 2)); return; }
+      const out = [fmt(annotated)];
+      if (blocks.length) out.push("", "BLOCKS:", fmtBlocks(blocks));
+      console.log(out.join("\n"));
       return;
     }
     if (cmd === "scan") {
       const [lo, hi] = parseRange(a.range);
       const res = await scan();
       if (a.json) { console.log(JSON.stringify(res, null, 2)); return; }
-      console.log(fmtScan(res, (p) => lo == null || (p >= lo && p <= hi)));
+      const blocks = await reg.listBlocks({}); // annotate each port with its owning block (this machine)
+      console.log(fmtScan(res, (p) => lo == null || (p >= lo && p <= hi), blocks));
       return;
     }
     if (cmd === "env" || cmd === "ecosystem") {
@@ -228,18 +308,31 @@ async function main() {
     }
     if (cmd === "import") {
       if (!remote) throw new Error("import needs a fleet server — set PORTBOOK_SERVER=http://<host>:7800");
-      // Read THIS machine's local reservations (list() always reads the local ~/.portbook file — the
-      // client is a separate module) and commit each to the shared server verbatim. A per-port
-      // "already reserved on <machine>" conflict means it's already there → skip it, don't abort.
+      // Read THIS machine's local reservations AND territory blocks (list()/listBlocks() always read the
+      // local ~/.portbook file — the client is a separate module) and commit each to the shared server
+      // verbatim. A per-port "already reserved on <machine>" conflict means it's already there → skip it,
+      // don't abort.
       const local = list(); // local registry, regardless of $PORTBOOK_SERVER
       const imported = [], skipped = [];
       for (const r of local) {
         try { imported.push(await remote.importReservation(r)); }
         catch (e) { if (/already reserved on/.test(e?.message || "")) skipped.push(r); else throw e; }
       }
+      // Blocks too: the core lets a project overlap its OWN block, so re-importing the same block would
+      // duplicate it — dedupe against what the server already holds for this machine (project + range).
+      const localBlocks = listBlocks();
+      const onServer = localBlocks.length ? await reg.listBlocks({}) : [];
+      const me = machineName();
+      const present = (b) => onServer.some((s) => (s.machine || me) === me && s.project === b.project && s.rangeStart === b.rangeStart && s.rangeEnd === b.rangeEnd);
+      const blocksImported = [], blocksSkipped = [];
+      for (const b of localBlocks) {
+        if (present(b)) { blocksSkipped.push(b); continue; }
+        try { blocksImported.push(await remote.importBlock(b)); }
+        catch (e) { if (/overlaps|contains/.test(e?.message || "")) blocksSkipped.push(b); else throw e; }
+      }
       const server = process.env.PORTBOOK_SERVER;
-      if (a.json) console.log(JSON.stringify({ server, imported, skipped: skipped.length }, null, 2));
-      else console.log(`imported ${imported.length} reservation(s) to ${server} (skipped ${skipped.length} already present)`);
+      if (a.json) console.log(JSON.stringify({ server, imported, skipped: skipped.length, blocksImported, blocksSkipped: blocksSkipped.length }, null, 2));
+      else console.log(`imported ${imported.length} reservation(s) and ${blocksImported.length} block(s) to ${server} (skipped ${skipped.length} reservation(s), ${blocksSkipped.length} block(s) already present)`);
       return;
     }
     console.error(`unknown command: ${cmd}\n`);
