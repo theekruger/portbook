@@ -18,6 +18,33 @@ reserve / release / list / check / scan / ecosystem / gc where you work. The eti
 should follow (reserve before you bind, release on stop, record the PID) is in
 [AGENTS.md](../AGENTS.md).
 
+## Adopting portbook in a harness you don't control
+
+portbook never needs to be *baked into* a harness or approved by its vendor — it attaches from the
+outside, through configuration you already own. In rough order of preference:
+
+1. **MCP (works almost everywhere).** MCP servers are **user-configured**, not vendor-shipped: drop
+   the [`mcp.json`](../integrations/mcp/mcp.json) block into the harness's MCP settings and it gains
+   portbook's seven tools — no cooperation from the harness's author required. Claude Code, Codex,
+   Cursor, Windsurf, Copilot CLI, and effectively every modern agent harness speak MCP.
+2. **ACP editors get it for free, via MCP.** The [Agent Client Protocol](https://agentclientprotocol.com)
+   connects editors (Zed, JetBrains AI Assistant, Neovim plugins) to any ACP agent — and when an ACP
+   session starts, **the editor passes its configured MCP servers through to the agent**. portbook
+   stays at the tool layer (MCP) and ACP carries it into whatever agent connects; portbook does not
+   need to speak ACP itself.
+3. **Instruction files, for convention-following.** Harnesses that read `AGENTS.md` / `CLAUDE.md` /
+   global rules will follow the *reserve-before-bind* convention with the plain CLI, even with no MCP
+   at all. Drop the rule from [AGENTS.md](../AGENTS.md) into your global agent instructions
+   (e.g. `~/.claude/CLAUDE.md`, Windsurf's `global_rules.md`).
+4. **CLI + HTTP, the universal floor.** Any harness that can run a shell command can
+   `portbook reserve … --json`; anything that can only make web requests can use the
+   [HTTP API](#http-api) from `portbook serve`. No integration code anywhere.
+
+One honest caveat applies to all four: portbook is a *cooperative* convention (see
+[Limitations](../README.md#limitations)) — these paths make it available to a foreign harness, and the
+instruction layer makes it *likely* to be followed, but nothing forces a process to reserve before it
+binds.
+
 ## MCP server
 
 For any **MCP-aware** harness. The client spawns `portbook mcp` and talks
