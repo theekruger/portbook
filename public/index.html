@@ -99,6 +99,7 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 let blocks = []; // project port territories from /api/blocks (machine-scoped)
+let gen = 0;     // refresh sequence — bumped per refresh() so a slow, older response can never paint over a newer one
 
 async function api(path, opts) {
   // If the server is token-protected, send a token from localStorage; on 401 prompt once and retry.
@@ -170,8 +171,9 @@ function render(e) {
     `</tbody></table>`;
 }
 
-async function refreshFleet(localMachine) {
+async function refreshFleet(localMachine, g) {
   let f; try { f = await api("/api/fleet"); } catch { return; }
+  if (g !== gen) return; // a newer refresh owns the DOM now — drop this stale response
   const counts = {};
   for (const r of f.reservations) counts[r.machine] = (counts[r.machine] || 0) + 1;
   const names = [...new Set([...Object.keys(counts), ...Object.keys(f.reports || {})])];
@@ -199,10 +201,20 @@ function renderBlocks(machine) {
 }
 
 async function refresh() {
+  // Overlapping refreshes (4s timer + post-action calls) can resolve out of order — /api/ecosystem
+  // shells out to docker/wsl/PowerShell and can outlive several ticks. Only the LATEST sequence may
+  // touch the DOM (or the shared `blocks`); check after every await, where staleness can appear.
+  const g = ++gen;
+  let b = [];
   // Load blocks first so host-port rows can show their territory hint; tolerate a missing endpoint.
-  try { const b = await api("/api/blocks"); blocks = Array.isArray(b) ? b : []; } catch { blocks = []; }
-  try { const e = await api("/api/ecosystem"); render(e); renderBlocks(e.machine); refreshFleet(e.machine); }
-  catch (e) { $("updated").textContent = "error: " + e.message; }
+  try { const r = await api("/api/blocks"); b = Array.isArray(r) ? r : []; } catch { /* keep [] */ }
+  if (g !== gen) return;
+  blocks = b;
+  try {
+    const e = await api("/api/ecosystem");
+    if (g !== gen) return;
+    render(e); renderBlocks(e.machine); refreshFleet(e.machine, g);
+  } catch (e) { if (g === gen) $("updated").textContent = "error: " + e.message; }
 }
 
 document.addEventListener("click", async (ev) => {

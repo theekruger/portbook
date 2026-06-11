@@ -19,19 +19,31 @@ const pexec = promisify(execFile);
 // Parse a docker/nerdctl "Ports" string, e.g.
 //   "127.0.0.1:6379->6379/tcp, 0.0.0.0:8025->8025/tcp, [::]:8025->8025/tcp, 6380/tcp"
 // into published host mappings and internal-only (exposed but not published) ports. IPv4/IPv6
-// duplicates of the same host port collapse to one entry.
+// duplicates of the same host port collapse to one entry. Docker compresses contiguous ranges
+// ("0.0.0.0:8000-8005->8000-8005/tcp", internal "8000-8005/tcp") — expand those to per-port
+// mappings, paired positionally, capped so a pathological `-p 1-65535` can't balloon the result.
+const RANGE_CAP = 256; // max ports expanded per ranged token
 export function parsePorts(s) {
   const published = new Map(); // hostPort -> mapping
   const internal = new Map();  // containerPort -> mapping
   for (const part of String(s || "").split(",").map((x) => x.trim()).filter(Boolean)) {
-    const pub = part.match(/^(?:(\[[^\]]+\]|[\d.]+):)?(\d+)->(\d+)\/(\w+)$/);
+    const pub = part.match(/^(?:(\[[^\]]+\]|[\d.]+):)?(\d+)(?:-(\d+))?->(\d+)(?:-(\d+))?\/(\w+)$/);
     if (pub) {
-      const hostPort = Number(pub[2]);
-      if (!published.has(hostPort)) published.set(hostPort, { hostIp: pub[1] || null, hostPort, containerPort: Number(pub[3]), proto: pub[4] });
+      const h0 = Number(pub[2]), h1 = pub[3] ? Number(pub[3]) : h0, c0 = Number(pub[4]);
+      for (let i = 0; i <= Math.min(h1 - h0, RANGE_CAP - 1); i++) {
+        const hostPort = h0 + i;
+        if (!published.has(hostPort)) published.set(hostPort, { hostIp: pub[1] || null, hostPort, containerPort: c0 + i, proto: pub[6] });
+      }
       continue;
     }
-    const ex = part.match(/^(\d+)\/(\w+)$/);
-    if (ex) { const cp = Number(ex[1]); if (!internal.has(cp)) internal.set(cp, { containerPort: cp, proto: ex[2] }); }
+    const ex = part.match(/^(\d+)(?:-(\d+))?\/(\w+)$/);
+    if (ex) {
+      const a = Number(ex[1]), b = ex[2] ? Number(ex[2]) : a;
+      for (let i = 0; i <= Math.min(b - a, RANGE_CAP - 1); i++) {
+        const cp = a + i;
+        if (!internal.has(cp)) internal.set(cp, { containerPort: cp, proto: ex[3] });
+      }
+    }
   }
   return { published: [...published.values()], internal: [...internal.values()] };
 }
@@ -74,16 +86,26 @@ export async function getContainers() {
 // WSL distros (Windows only). Informational: ports INSIDE a distro aren't visible from here without a
 // reporter running in it — but WSL2 auto-forwards many to localhost, so they often appear as host
 // listeners owned by `wslrelay.exe`. We surface the distros so the picture is complete.
+
+// Parse raw `wsl.exe -l -v` bytes (exported for tests). wsl emits UTF-16LE by default but honors
+// WSL_UTF8=1 (plain UTF-8) — sniff instead of assuming: this ASCII-range table always interleaves
+// NUL high bytes in UTF-16LE, and valid UTF-8 text never contains NUL. The STATE column can be
+// multiword on localized Windows ("Wird ausgeführt"), so match it lazily up to the trailing VERSION.
+export function parseWslList(buf) {
+  const text = buf.includes(0) ? buf.toString("utf16le") : buf.toString("utf8");
+  const out = [];
+  for (const line of text.split(/\r?\n/).slice(1)) { // skip the header row
+    const m = line.match(/^(\*?)\s*(\S+)\s+(.+?)\s+(\d+)\s*$/);
+    if (m) out.push({ name: m[2], state: m[3], version: Number(m[4]), default: m[1] === "*" });
+  }
+  return out;
+}
+
 export async function getWsl() {
   if (process.platform !== "win32") return [];
   try {
-    const { stdout } = await pexec("wsl.exe", ["-l", "-v"], { timeout: 8000, maxBuffer: 1 << 20, encoding: "utf16le" });
-    const out = [];
-    for (const line of stdout.split(/\r?\n/).slice(1)) { // skip the header row
-      const m = line.match(/^(\*?)\s*(\S+)\s+(\S+)\s+(\d+)\s*$/);
-      if (m) out.push({ name: m[2], state: m[3], version: Number(m[4]), default: m[1] === "*" });
-    }
-    return out;
+    const { stdout } = await pexec("wsl.exe", ["-l", "-v"], { timeout: 8000, maxBuffer: 1 << 20, encoding: "buffer" });
+    return parseWslList(stdout);
   } catch { return []; }
 }
 
@@ -94,8 +116,13 @@ export async function ecosystem() {
   const [listeners, containerInfo, wsl] = await Promise.all([getListeners(), getContainers(), getWsl()]);
   const { containers, runtimes } = containerInfo;
   const reservations = list();
+  const me = machineName();
+  // Cross-reference only THIS machine's rows (legacy machine-less rows are local), mirroring scan():
+  // on a fleet host the ledger holds every machine's rows — a remote hold must not label a local
+  // listener "managed", and a live remote reservation must never surface as a releasable "ghost".
+  const mine = reservations.filter((r) => !r.machine || r.machine === me);
 
-  const resByPort = new Map(reservations.map((r) => [r.port, r]));
+  const resByPort = new Map(mine.map((r) => [r.port, r]));
   const containerByHostPort = new Map();
   for (const c of containers) for (const p of c.ports) {
     if (!containerByHostPort.has(p.hostPort)) containerByHostPort.set(p.hostPort, { name: c.name, image: c.image, runtime: c.runtime, containerPort: p.containerPort, proto: p.proto });
@@ -110,10 +137,10 @@ export async function ecosystem() {
     return { port: l.port, pid: l.pid, proc: l.proc, container, reservation, kind };
   }).sort((a, b) => a.port - b.port);
 
-  const ghosts = reservations.filter((r) => !seen.has(r.port)).sort((a, b) => a.port - b.port);
+  const ghosts = mine.filter((r) => !seen.has(r.port)).sort((a, b) => a.port - b.port);
 
   return {
-    machine: machineName(),
+    machine: me,
     at: new Date().toISOString(),
     runtimes: { docker: runtimes.includes("docker"), nerdctl: runtimes.includes("nerdctl"), podman: runtimes.includes("podman"), wsl: wsl.length > 0 },
     summary: {

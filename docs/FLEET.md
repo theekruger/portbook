@@ -4,7 +4,8 @@
 > machine's `reserve`/`release`/`list`/`check`/`gc` coordinate against that shared `portbook serve`
 > authority instead of its local file; `portbook report` pushes a machine's ecosystem up and
 > `portbook fleet` shows every machine. Conflicts are per-machine (two machines can both use 5000).
-> Still local-only by design: a live multi-machine dashboard and auth hardening are the next steps.
+> Optional bearer auth (`PORTBOOK_TOKEN`) and a fleet section in the dashboard ship today; still
+> self-hosted by design — richer cross-machine views are future work.
 
 ## Using it today
 
@@ -75,24 +76,41 @@ IP on an encrypted mesh, so:
 **Server** — a new subcommand wrapping the existing core (the registry functions don't change; only
 where they run and how they're reached):
 
+There is **no `--token` flag** — auth is the `PORTBOOK_TOKEN` env var on the server process
+(optional, but recommended once the server leaves `127.0.0.1`):
+
 ```bash
-# on the chosen host (e.g. an always-on node), bound to its tailnet IP:
-portbook serve --bind 100.x.y.z:7800        # optional: --token $PORTBOOK_TOKEN
+# on the chosen host (e.g. an always-on node), bound to its tailnet IP — bash:
+PORTBOOK_TOKEN=<secret> portbook serve --bind 100.x.y.z --port 7800
 ```
 
-It exposes the current operations as JSON over HTTP:
+```powershell
+# same thing from PowerShell:
+$env:PORTBOOK_TOKEN = "<secret>"; portbook serve --bind 100.x.y.z --port 7800
+```
 
-| Method & path        | Maps to        | Notes                                            |
-|----------------------|----------------|--------------------------------------------------|
-| `POST /reserve`      | `reserve()`    | body = reserve opts; client includes its `machine` + free-check result |
-| `POST /release`      | `release()`    |                                                  |
-| `GET  /list`         | `list()`       | `?machine=` to filter; returns all machines by default |
-| `GET  /check/:port`  | `check()`      |                                                  |
-| `POST /gc`           | `gc()`         | TTL-based; per-machine PID liveness is client-reported |
-| `GET  /scan`         | aggregates     | each client POSTs its own `scan()`; server merges |
-| `GET  /blocks`       | `listBlocks()` | `?project=` to filter; port-territory blocks for every machine |
-| `POST /blocks`       | `reserveBlock()` | claim a range; body carries the client's `machine` |
-| `POST /blocks/release` | `releaseBlock()` |                                                |
+It exposes the current operations as JSON over HTTP — every data route lives under `/api/`
+(`src/server.js` is the source of truth):
+
+| Method & path              | Maps to          | Notes                                            |
+|----------------------------|------------------|--------------------------------------------------|
+| `GET  /`                   | the dashboard    | static HTML shell; stays public even with a token |
+| `POST /api/reserve`        | `reserve()`      | body = reserve opts; a fleet client adds its `machine` and `probe:false` (it free-checks locally) → the reservation(s) made |
+| `POST /api/release`        | `release()`      | `{ port \| project \| id, machine? }` → `{ released: <count> }` |
+| `GET  /api/list`           | `list()`         | `?project=` to filter; `?raw=1` skips live annotation (fleet clients annotate locally). Returns every machine's rows — clients filter by `machine` themselves |
+| `GET  /api/check/:port`    | `check()`        | `{ port, reservation, osFree }`                  |
+| `POST /api/gc`             | `gc()`           | TTL-based → `{ reclaimed: <count> }`; PID liveness is per-machine, client-side |
+| `GET  /api/scan`           | `scan()`         | the server host's **own** OS listeners (not fleet-wide) |
+| `GET  /api/ecosystem`      | `ecosystem()`    | the server host's own host + containers + WSL view |
+| `POST /api/report`         | —                | `{ machine, ecosystem }` → `{ ok, machines }`; how a machine pushes its view up |
+| `GET  /api/fleet`          | —                | `{ server, at, reservations, blocks, reports }` — every machine's holds + latest reports |
+| `GET  /api/blocks`         | `listBlocks()`   | `?project=` to filter; port-territory blocks for every machine |
+| `POST /api/blocks`         | `reserveBlock()` | claim a range; body carries the client's `machine` → the block made |
+| `POST /api/blocks/release` | `releaseBlock()` | `{ id \| project, machine? }` → `{ released: <count> }` |
+
+*Future (not implemented):* a server-side `machine` filter on `/api/list`, and server-side merging of
+client-posted scans. Today cross-machine visibility comes from `POST /api/report` + `GET /api/fleet`,
+and clients filter `list` rows by `machine` themselves — exactly what the bundled fleet client does.
 
 **Port-territory blocks are fleet-aware too.** A project's claimed range lives in the same shared
 ledger as reservations and is **machine-scoped** (a `machine` field, mirroring reservations — the same
@@ -135,9 +153,11 @@ So:
    machines write to it. No change to `registry.js`'s logic — it's the same core, hosted. Each
    machine still runs its own `ecosystem()` locally and reports it up, since only it can see inside
    its own containers/processes.
-3. **Point machines at the server** by exporting `PORTBOOK_SERVER`. Existing local registries can be
-   imported once (`portbook list --json` on each machine → `POST /reserve`).
-4. **Optional dashboard** — a read-only web view of `GET /list` + `GET /scan`: "who's on what,
+3. **Point machines at the server** by exporting `PORTBOOK_SERVER`. Existing local registries are
+   imported once with `portbook import` on each machine — it pushes that machine's reservations *and*
+   territory blocks into the shared ledger, skipping anything already present.
+4. **Dashboard** — `portbook serve` already serves the live web view at `GET /`, and it grows a fleet
+   section (fed by `GET /api/fleet`) once several machines share the registry: "who's on what,
    everywhere." This is the managed-hosting / control-plane surface in the README roadmap.
 
 ## Trust & operational notes
@@ -145,7 +165,9 @@ So:
 - **Optionally token-protected.** Set `PORTBOOK_TOKEN=<secret>` when you run `portbook serve` and the
   server gates the data API (`/api/*`) behind `Authorization: Bearer <secret>` (returning 401 without
   it). Clients send it automatically when the same `PORTBOOK_TOKEN` is in their environment, and the
-  browser dashboard prompts for it once. Beyond the token it's cooperative — the server trusts the
+  browser dashboard prompts for it once. Independently of the token, state-changing `POST`s that
+  arrive with a cross-site browser `Origin` are rejected unless they carry the token — so a drive-by
+  web page can't mutate the registry through your browser. Beyond that it's cooperative — the server trusts the
   `machine` name and OS check a client sends (it can't verify another machine's OS or identity) — so
   still bind it to a **private** interface (your Tailscale IP), never the public internet. Same trust
   model as any internal dev service.

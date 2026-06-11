@@ -16,6 +16,9 @@ const CLI = path.join(here, "..", "bin", "portbook.js");
 const localDir = fs.mkdtempSync(path.join(os.tmpdir(), "portbook-import-local-"));
 const serverDir = fs.mkdtempSync(path.join(os.tmpdir(), "portbook-import-server-"));
 
+// Tests must not inherit fleet config (docs/FLEET.md tells users to export these in the profile);
+// scrub BEFORE importing src modules — a leaked PORTBOOK_TOKEN would 401 the raw fetches below.
+for (const k of ["PORTBOOK_SERVER", "PORTBOOK_TOKEN", "PORTBOOK_MACHINE"]) delete process.env[k];
 // This process IS the "local" machine: bind its registry to localDir BEFORE importing registry.js.
 process.env.PORTBOOK_DIR = localDir;
 const registry = await import("../src/registry.js");
@@ -31,7 +34,7 @@ const SERVER_PORT = await registry.reserve({ project: "_srv", count: 1, rangeSta
 await registry.release({ project: "_srv" }); // free it again; the child binds it for real
 
 const child = spawn(process.execPath, [CLI, "serve", "--port", String(SERVER_PORT)], {
-  env: { ...process.env, PORTBOOK_DIR: serverDir, PORTBOOK_SERVER: "" }, // child must NOT inherit fleet mode
+  env: { ...process.env, PORTBOOK_DIR: serverDir, PORTBOOK_SERVER: "", PORTBOOK_TOKEN: "" }, // child must NOT inherit fleet mode or auth
   stdio: "ignore",
 });
 const SERVER = `http://127.0.0.1:${SERVER_PORT}`;
@@ -44,6 +47,15 @@ async function waitForServer() {
   }
   return false;
 }
+
+// Spawn the CLI against the LOCAL store (no fleet), capturing exit code + stdout/stderr.
+const runCli = (args) => new Promise((resolve) => {
+  const p = spawn(process.execPath, [CLI, ...args], { env: { ...process.env, PORTBOOK_SERVER: "" } });
+  let out = "", err = "";
+  p.stdout.on("data", (d) => { out += d; });
+  p.stderr.on("data", (d) => { err += d; });
+  p.on("close", (code) => resolve({ code, out, err }));
+});
 
 async function run() {
   ok("server subprocess came up", await waitForServer());
@@ -68,10 +80,12 @@ async function run() {
       catch (e) { if (/already reserved on/.test(e?.message || "")) skipped.push(r); else throw e; }
     }
     // Blocks too — mirror bin/portbook.js's import branch: dedupe against the server, skip overlap/contains.
+    // The dedupe keys on the BLOCK's own machine (importBlock carries `b.machine || me`), so blocks
+    // recorded for another machine stay idempotent too.
     const localBlocks = registry.listBlocks();
     const onServerBlocks = localBlocks.length ? await client.listBlocks({}) : [];
     const me = registry.machineName();
-    const present = (b) => onServerBlocks.some((s) => (s.machine || me) === me && s.project === b.project && s.rangeStart === b.rangeStart && s.rangeEnd === b.rangeEnd);
+    const present = (b) => { const bm = b.machine || me; return onServerBlocks.some((s) => (s.machine || me) === bm && s.project === b.project && s.rangeStart === b.rangeStart && s.rangeEnd === b.rangeEnd); };
     const blocksImported = [], blocksSkipped = [];
     for (const b of localBlocks) {
       if (present(b)) { blocksSkipped.push(b); continue; }
@@ -108,6 +122,49 @@ async function run() {
   ok("server still holds exactly 2 (no duplicates)", (await (await fetch(SERVER + "/api/list?raw=1")).json()).length === 2);
   ok("re-run skips the block too (idempotent)", second.blocksImported.length === 0 && second.blocksSkipped.length === 1);
   ok("server still holds exactly 1 block (no duplicates)", (await (await fetch(SERVER + "/api/blocks")).json()).length === 1);
+
+  // A block recorded for ANOTHER machine (a migrated multi-machine registry) must import once and
+  // then dedupe on re-runs — the old present() keyed on the CURRENT machine, so foreign blocks
+  // re-imported as duplicates on every run.
+  await registry.reserveBlock({ project: "gamma", rangeStart: 47740, rangeEnd: 47749, machine: "other-machine" });
+  const third = await doImport();
+  ok("a foreign-machine block imports once, machine preserved",
+    third.blocksImported.length === 1 && third.blocksImported[0].machine === "other-machine" && third.blocksSkipped.length === 1);
+  const fourth = await doImport();
+  ok("re-run skips the foreign-machine block too (idempotent)", fourth.blocksImported.length === 0 && fourth.blocksSkipped.length === 2);
+  ok("server holds exactly 2 blocks (no foreign duplicates)", (await (await fetch(SERVER + "/api/blocks")).json()).length === 2);
+
+  // ── Strict numeric flags: garbage --ttl/--pid/--port/--count/--range must exit 1 loudly. The old
+  // num() yielded NaN, silently writing a PERMANENT hold (pid/expiresAt null) — defeating crash reclaim.
+  const flagCases = [
+    [["reserve", "--project", "x", "--port", "47750", "--ttl", "30s"], /invalid --ttl/],
+    [["reserve", "--project", "x", "--port", "47750", "--pid", "abc"], /invalid --pid/],
+    [["reserve", "--project", "x", "--port", "12x"], /invalid --port/],
+    [["reserve", "--project", "x", "--count", "two"], /invalid --count/],
+    [["reserve", "--project", "x", "--range", "abc-def"], /invalid --range/],
+    [["release", "--port", "abc"], /invalid --port/],
+  ];
+  let strictOk = true;
+  for (const [args, re] of flagCases) {
+    const r = await runCli(args);
+    if (r.code !== 1 || !re.test(r.err)) { strictOk = false; console.log(`    (flag case failed: ${args.join(" ")} → code ${r.code}, stderr: ${r.err.trim()})`); }
+  }
+  ok("non-numeric --ttl/--pid/--port/--count/--range exit 1 with a clear message", strictOk);
+  ok("no reservation leaked from rejected flags", !registry.list().some((r) => r.port === 47750));
+  // …and a valid --ttl still reserves, recording a real expiry (the silent-permanent path is gone).
+  const good = await runCli(["reserve", "--project", "ttl-ok", "--port", "47751", "--ttl", "60", "--adopt", "--json"]);
+  const goodRow = good.code === 0 ? JSON.parse(good.out)[0] : null;
+  ok("valid --ttl reserves with expiresAt recorded", !!goodRow && typeof goodRow.expiresAt === "string");
+
+  // ── `portbook list --json` is ALWAYS a bare array of reservation rows (the documented `jq '.[]'`
+  // contract) even when blocks exist — they do here. Blocks keep their own `blocks --json` surface.
+  const lj = await runCli(["list", "--json", "--no-probe"]);
+  const shape = JSON.parse(lj.out);
+  ok("list --json stays a bare array even when blocks exist",
+    lj.code === 0 && Array.isArray(shape) && shape.every((r) => typeof r.port === "number") && registry.listBlocks().length > 0);
+  const bj = await runCli(["blocks", "--json"]);
+  const bshape = JSON.parse(bj.out);
+  ok("blocks --json is the blocks surface (bare array)", bj.code === 0 && Array.isArray(bshape) && bshape.some((b) => b.rangeStart === 47720));
 
   // The CLI guards fleet mode: without PORTBOOK_SERVER, `portbook import` must error clearly.
   const noFleet = await new Promise((resolve) => {

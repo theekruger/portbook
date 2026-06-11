@@ -14,7 +14,7 @@ surface fits the tool:
 
 All of these are thin clients over the **zero-dependency** core (`src/registry.js` +
 `src/environments.js`). None of them change the registry's behavior — they just surface
-reserve / release / list / check / scan / ecosystem / gc where you work. The etiquette every agent
+reserve / release / list / check / scan / ecosystem / gc (and port-territory blocks) where you work. The etiquette every agent
 should follow (reserve before you bind, release on stop, record the PID) is in
 [AGENTS.md](../AGENTS.md).
 
@@ -25,7 +25,7 @@ outside, through configuration you already own. In rough order of preference:
 
 1. **MCP (works almost everywhere).** MCP servers are **user-configured**, not vendor-shipped: drop
    the [`mcp.json`](../integrations/mcp/mcp.json) block into the harness's MCP settings and it gains
-   portbook's seven tools — no cooperation from the harness's author required. Claude Code, Codex,
+   portbook's ten tools — no cooperation from the harness's author required. Claude Code, Codex,
    Cursor, Windsurf, Copilot CLI, and effectively every modern agent harness speak MCP.
 2. **ACP editors get it for free, via MCP.** The [Agent Client Protocol](https://agentclientprotocol.com)
    connects editors (Zed, JetBrains AI Assistant, Neovim plugins) to any ACP agent — and when an ACP
@@ -48,9 +48,9 @@ binds.
 ## MCP server
 
 For any **MCP-aware** harness. The client spawns `portbook mcp` and talks
-newline-delimited JSON-RPC 2.0 over stdio; the server exposes seven tools —
-`reserve`, `release`, `list`, `check`, `scan`, `ecosystem`, `gc` — mirroring the library and HTTP
-APIs.
+newline-delimited JSON-RPC 2.0 over stdio; the server exposes ten tools —
+`reserve`, `release`, `list`, `check`, `scan`, `ecosystem`, `gc`, plus the block-territory tools
+`reserve_block`, `list_blocks`, `release_block` — mirroring the library and HTTP APIs.
 
 Ready-to-copy config and per-harness setup blocks (Claude Code, Codex, Cursor, Windsurf, Hermes, and
 a generic stdio entry) are in **[integrations/mcp/](../integrations/mcp/)**:
@@ -87,12 +87,14 @@ language — talk to portbook directly.
 
 ### CLI
 
-`portbook` is on your `PATH` after `npm link`. Add `--json` to `reserve`/`list`/`scan`/`env` for
-machine-readable output (`check` is always JSON):
+`portbook` is on your `PATH` after `npm link`. Add `--json` to `reserve`/`list`/`blocks`/`scan`/`env`
+for machine-readable output (`check` is always JSON). `list --json` is always a plain **array** of
+reservations — port territories have their own surface, `portbook blocks --json`:
 
 ```bash
 PORT=$(portbook reserve --project myapp --count 1 --owner agent)   # capture a free port
 portbook list --json | jq '.[] | select(.bound==false)'           # reserved but not listening
+portbook blocks --json                                             # port-territory blocks
 portbook check 4100                                                # reserved? OS-free? (JSON)
 portbook scan --json                                               # everything listening here
 ```
@@ -105,18 +107,21 @@ Full command reference: `portbook help`, or the [README](../README.md#use).
 `--port` / `--bind`). Responses are JSON; CORS is permissive (`Access-Control-Allow-Origin: *`) so a
 browser dashboard can call it.
 
-| Method & path           | Body / params                         | Returns |
-|-------------------------|---------------------------------------|---------|
-| `GET /`                 | —                                     | the live HTML dashboard |
-| `GET /api/ecosystem`    | —                                     | whole-machine view (host + containers + WSL) |
-| `GET /api/scan`         | —                                     | listening: managed / unmanaged / ghosts |
-| `GET /api/list`         | `?project=<name>` (optional)          | reservations (annotated with live state) |
-| `GET /api/check/:port`  | port in path                          | `{ port, reservation, osFree }` |
-| `GET /api/fleet`        | —                                     | every machine's reservations + each machine's latest report |
-| `POST /api/reserve`     | JSON body = reserve opts (`project` required; `machine`/`probe` for fleet) | the reservation(s) made |
-| `POST /api/release`     | JSON body `{ port | project | id, machine? }` | count released |
-| `POST /api/gc`          | —                                     | reclaimed (stale) reservations |
-| `POST /api/report`      | JSON body `{ machine, ecosystem }`    | `{ ok, machines }` — a machine pushes its ecosystem to the fleet view |
+| Method & path              | Body / params                         | Returns |
+|----------------------------|---------------------------------------|---------|
+| `GET /`                    | —                                     | the live HTML dashboard |
+| `GET /api/ecosystem`       | —                                     | whole-machine view (host + containers + WSL) |
+| `GET /api/scan`            | —                                     | listening: managed / unmanaged / ghosts |
+| `GET /api/list`            | `?project=<name>`, `?raw=1` (both optional) | reservations annotated with live state; `raw=1` skips annotation (fleet clients annotate against their own OS) |
+| `GET /api/check/:port`     | port in path                          | `{ port, reservation, osFree }` |
+| `GET /api/fleet`           | —                                     | `{ server, at, reservations, blocks, reports }` — every machine's holds + latest reports |
+| `GET /api/blocks`          | `?project=<name>` (optional)          | port-territory blocks (every machine's) |
+| `POST /api/reserve`        | JSON body = reserve opts (`project` required; `machine`/`probe` for fleet) | the reservation(s) made |
+| `POST /api/release`        | JSON body `{ port \| project \| id, machine? }` | `{ released: <count> }` |
+| `POST /api/blocks`         | JSON body `{ project, rangeStart, rangeEnd, owner?, purpose?, machine? }` | the block made |
+| `POST /api/blocks/release` | JSON body `{ id \| project, machine? }` | `{ released: <count> }` |
+| `POST /api/gc`             | —                                     | `{ reclaimed: <count> }` — a count (the library/MCP `gc` return the removed entries instead) |
+| `POST /api/report`         | JSON body `{ machine, ecosystem }`    | `{ ok, machines }` — a machine pushes its ecosystem to the fleet view |
 
 ```bash
 portbook serve --bind 127.0.0.1 --port 7800 &

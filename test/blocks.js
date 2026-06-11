@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 
+// A dev machine configured per docs/FLEET.md exports these — scrub them so the test is hermetic.
+for (const k of ["PORTBOOK_SERVER", "PORTBOOK_TOKEN", "PORTBOOK_MACHINE"]) delete process.env[k];
 process.env.PORTBOOK_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "portbook-test-"));
 const { reserve, reserveBlock, releaseBlock, listBlocks } = await import("../src/registry.js");
 
@@ -17,6 +19,17 @@ const inRange = (p, lo, hi) => p >= lo && p <= hi;
 const blk = await reserveBlock({ project: "alpha", rangeStart: 47000, rangeEnd: 47099, owner: "blocks" });
 ok("reserveBlock returns a block", blk && blk.rangeStart === 47000 && blk.rangeEnd === 47099 && !!blk.id);
 ok("listBlocks shows the new block", listBlocks().some((b) => b.id === blk.id && b.project === "alpha"));
+
+// (1b) Re-claiming the IDENTICAL block (same project/range/machine) is IDEMPOTENT — the existing row
+// comes back, sequentially and under a race; the ledger never stacks duplicates.
+const again = await reserveBlock({ project: "alpha", rangeStart: 47000, rangeEnd: 47099 });
+ok("identical re-claim returns the existing block (same id)", again.id === blk.id);
+const racers = await Promise.all([
+  reserveBlock({ project: "alpha", rangeStart: 47000, rangeEnd: 47099 }),
+  reserveBlock({ project: "alpha", rangeStart: 47000, rangeEnd: 47099 }),
+]);
+ok("racing identical claims never stack duplicates",
+  racers.every((b) => b.id === blk.id) && listBlocks({ project: "alpha" }).length === 1);
 
 // (2) A specific port inside ANOTHER project's block is rejected.
 let foreignPort = false;

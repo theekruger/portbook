@@ -6,11 +6,20 @@
 // output stream — diagnostics go to process.stderr — or the harness's parser will choke.
 //
 // Zero dependencies: just the registry/environment functions and node streams.
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { reserve, release, list, check, gc, scan, annotate } from "./registry.js";
+import { reserve, release, list, check, gc, scan, annotate, reserveBlock, releaseBlock, listBlocks } from "./registry.js";
 import { ecosystem } from "./environments.js";
 
-const PROTOCOL_VERSION = "2024-11-05"; // fallback when the client doesn't announce its own
+// serverInfo reports the REAL package version, read once at load — a hardcoded literal here sat at
+// 0.2.0 across two releases and pointed anyone debugging tool behavior at the wrong changelog.
+const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+
+// Protocol revisions this server implements. initialize echoes the client's requested revision only
+// when it's one of these — echoing an arbitrary string would claim mandatory behaviors we may not
+// have — otherwise it answers PROTOCOL_VERSION and lets the client decide (per the MCP spec).
+const SUPPORTED_PROTOCOLS = ["2024-11-05", "2025-03-26", "2025-06-18"];
+const PROTOCOL_VERSION = "2024-11-05"; // default when the client's revision is unknown or absent
 
 // --- tool definitions ----------------------------------------------------------------------------
 // Each tool maps 1:1 onto a registry/environment call. `inputSchema` is a JSON Schema object so the
@@ -88,8 +97,56 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
     run: () => gc(),
   },
+  // Port TERRITORY (AGENTS.md rule 3): blocks mirror reserveBlock/releaseBlock/listBlocks 1:1, same
+  // as the CLI's `portbook block`/`blocks` and the HTTP /api/blocks endpoints.
+  {
+    name: "reserve_block",
+    description: "Claim a contiguous port range as a project's territory: its auto-picks land inside it and other projects are rejected there. Blocks are persistent (never gc'd) until released.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project that owns the block (required)." },
+        rangeStart: { ...port, description: "First port of the range (required)." },
+        rangeEnd: { ...port, description: "Last port of the range, inclusive (required)." },
+        owner: { type: "string", description: "Who/what claimed it (e.g. an agent name)." },
+        purpose: { type: "string", description: "Human note: what this range is for." },
+      },
+      required: ["project", "rangeStart", "rangeEnd"],
+    },
+    run: (a) => reserveBlock(a),
+  },
+  {
+    name: "list_blocks",
+    description: "List reserved port blocks (project territory), optionally for one project.",
+    inputSchema: {
+      type: "object",
+      properties: { project: { type: "string", description: "Only list blocks for this project." } },
+    },
+    run: (a) => listBlocks(a),
+  },
+  {
+    name: "release_block",
+    description: "Release reserved port block(s) by id or project. At least one selector is required; supplied selectors must all match. Returns the number released.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Release the single block with this id." },
+        project: { type: "string", description: "Release every block owned by this project." },
+      },
+    },
+    run: (a) => releaseBlock(a),
+  },
 ];
 const TOOL_BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));
+
+// Keep ONLY the arguments a tool's schema declares. The registry accepts more fields than the tools
+// advertise (probe/machine/host), and the MCP surface must not let a client smuggle those through —
+// probe:false skips the OS-free check, machine forges attribution, host triggers a DNS lookup.
+function declaredArgs(args, schema) {
+  const out = {};
+  for (const k of Object.keys(schema?.properties || {})) if (args?.[k] !== undefined) out[k] = args[k];
+  return out;
+}
 
 // --- JSON-RPC handling ----------------------------------------------------------------------------
 // Dispatch one parsed request. Returns the response object to send, or null for notifications (any
@@ -104,9 +161,9 @@ async function handle(msg) {
   try {
     if (method === "initialize") {
       return ok(id, {
-        protocolVersion: params?.protocolVersion || PROTOCOL_VERSION,
+        protocolVersion: SUPPORTED_PROTOCOLS.includes(params?.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSION,
         capabilities: { tools: {} },
-        serverInfo: { name: "portbook", version: "0.2.0" },
+        serverInfo: { name: "portbook", version: VERSION },
       });
     }
     if (method === "ping") return ok(id, {});
@@ -117,7 +174,7 @@ async function handle(msg) {
       const tool = TOOL_BY_NAME.get(params?.name);
       if (!tool) return ok(id, { content: [{ type: "text", text: `unknown tool: ${params?.name}` }], isError: true });
       try {
-        const value = await tool.run(params.arguments || {});
+        const value = await tool.run(declaredArgs(params.arguments, tool.inputSchema));
         return ok(id, { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] });
       } catch (e) {
         // Tool-level failures are reported as a successful result with isError — not a JSON-RPC error.
@@ -131,6 +188,18 @@ async function handle(msg) {
   }
 }
 
+// A parsed line is either one message or a JSON-RPC batch (Array). Batches ARE supported (mandatory
+// in MCP 2025-03-26, plain JSON-RPC 2.0 otherwise): elements are handled in order and the non-null
+// replies go out as ONE array; a batch of only notifications gets no reply; an empty batch is
+// invalid per spec. Silently dropping an array would strand every request in it that carries an id.
+async function dispatch(msg) {
+  if (!Array.isArray(msg)) return handle(msg);
+  if (!msg.length) return err(null, -32600, "empty batch");
+  const replies = [];
+  for (const m of msg) { const r = await handle(m); if (r) replies.push(r); }
+  return replies.length ? replies : null;
+}
+
 const ok = (id, result) => ({ jsonrpc: "2.0", id, result });
 const err = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
 
@@ -141,7 +210,12 @@ export function runMcpServer({ input = process.stdin, output = process.stdout } 
   return new Promise((resolve) => {
     let buf = "";
     let chain = Promise.resolve(); // serializes handlers so responses are emitted in request order
-    const write = (obj) => { if (obj) output.write(JSON.stringify(obj) + "\n"); };
+    // An abruptly killed harness surfaces as a stream 'error' (EPIPE when a reply hits the severed
+    // pipe, read errors on stdin) — with no listener that's an unhandled 'error' event, i.e. a crash.
+    // Treat either side dying as end-of-session; the write guard covers streams that throw instead.
+    input.on("error", () => resolve());
+    output.on("error", () => resolve());
+    const write = (obj) => { if (!obj) return; try { output.write(JSON.stringify(obj) + "\n"); } catch { /* peer gone */ } };
 
     input.setEncoding?.("utf8");
     input.on("data", (chunk) => {
@@ -154,7 +228,7 @@ export function runMcpServer({ input = process.stdin, output = process.stdout } 
         let req;
         try { req = JSON.parse(line); }
         catch { process.stderr.write("portbook mcp: skipping malformed line\n"); continue; }
-        chain = chain.then(() => handle(req)).then(write).catch((e) => process.stderr.write(`portbook mcp: ${e?.message || e}\n`));
+        chain = chain.then(() => dispatch(req)).then(write).catch((e) => process.stderr.write(`portbook mcp: ${e?.message || e}\n`));
       }
     });
     input.on("end", resolve);

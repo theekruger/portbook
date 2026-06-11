@@ -17,7 +17,9 @@ const pexec = promisify(execFile);
 export const DIR = process.env.PORTBOOK_DIR || path.join(os.homedir(), ".portbook");
 export const FILE = path.join(DIR, "registry.json");
 const LOCK = path.join(DIR, "registry.lock");
-const LOCK_STALE_MS = 15000;
+// Holders heartbeat (touch the lock's mtime) during slow work, so "stale" really means "crashed".
+// $PORTBOOK_LOCK_STALE_MS shrinks the window so the takeover paths are testable.
+const LOCK_STALE_MS = Number(process.env.PORTBOOK_LOCK_STALE_MS) || 15000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowISO = () => new Date().toISOString();
@@ -34,33 +36,77 @@ function ensureDir() { fs.mkdirSync(DIR, { recursive: true }); }
 async function acquireLock(timeoutMs = 5000) {
   ensureDir();
   const start = Date.now();
+  const token = `${process.pid}.${uid()}`; // identifies OUR tenancy of the lock dir
   for (;;) {
-    try { fs.mkdirSync(LOCK); return; } // mkdir is atomic: fails if another holder exists
-    catch {
+    try {
+      fs.mkdirSync(LOCK); // mkdir is atomic: fails if another holder exists
+      fs.writeFileSync(path.join(LOCK, "owner"), token); // so releaseLock removes only OUR lock
+      return token;
+    } catch {
       try {
         const st = fs.statSync(LOCK);
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) { try { fs.rmdirSync(LOCK); } catch { /* race */ } continue; }
-      } catch { /* lock vanished — retry */ }
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+          // Takeover must be ATOMIC: a naive rmdir+mkdir lets two breakers both "win" (one silently
+          // deletes the other's FRESH lock). rename hands the husk to exactly one breaker; losers
+          // throw into the outer catch and retry.
+          const tomb = `${LOCK}.${process.pid}.${Date.now()}.tomb`;
+          fs.renameSync(LOCK, tomb);
+          try {
+            // Re-judge on the tomb: if it's actually FRESH we raced a brand-new holder — hand it back.
+            if (Date.now() - fs.statSync(tomb).mtimeMs > LOCK_STALE_MS) fs.rmSync(tomb, { recursive: true, force: true });
+            else fs.renameSync(tomb, LOCK);
+          } catch { try { fs.rmSync(tomb, { recursive: true, force: true }); } catch { /* leaked tomb — inert */ } }
+          continue;
+        }
+      } catch { /* lock vanished or another breaker won — retry */ }
       if (Date.now() - start > timeoutMs) throw new Error("registry is locked by another process (retry, or run `portbook gc`)");
       await sleep(40);
     }
   }
 }
-function releaseLock() { try { fs.rmdirSync(LOCK); } catch { /* already gone */ } }
-export async function withLock(fn) { await acquireLock(); try { return await fn(); } finally { releaseLock(); } }
+// Remove the lock only if WE still own it: if our lock was judged stale and taken over, the new
+// holder's lock must survive our release (an ownerless rmdir would admit a third process mid-write).
+function releaseLock(token) {
+  try {
+    if (fs.readFileSync(path.join(LOCK, "owner"), "utf8") !== token) return; // not ours anymore
+    fs.rmSync(LOCK, { recursive: true, force: true });
+  } catch { /* already gone */ }
+}
+// Heartbeat: a holder doing slow work (e.g. probing a big port range) refreshes the lock's mtime so
+// a live-but-slow holder is never judged stale and stolen from.
+function touchLock() { try { const t = new Date(); fs.utimesSync(LOCK, t, t); } catch { /* best-effort */ } }
+export async function withLock(fn) { const token = await acquireLock(); try { return await fn(); } finally { releaseLock(token); } }
 
 export function readRegistry() {
+  let raw;
+  try { raw = fs.readFileSync(FILE, "utf8"); }
+  catch (e) {
+    if (e.code === "ENOENT") return { version: 1, reservations: [], blocks: [] }; // no registry yet
+    // EBUSY/EPERM/EACCES (AV / backup / sync tools) etc. — surface it. Returning "empty" here would
+    // make the caller's next writeRegistry silently wipe the whole ledger.
+    throw new Error(`cannot read registry ${FILE}: ${e.message}`);
+  }
   try {
-    const j = JSON.parse(fs.readFileSync(FILE, "utf8"));
+    const j = JSON.parse(raw);
+    if (!j || typeof j !== "object" || Array.isArray(j)) throw new Error("not a registry object");
     if (!Array.isArray(j.reservations)) j.reservations = [];
     if (!Array.isArray(j.blocks)) j.blocks = [];
     return j;
-  } catch { return { version: 1, reservations: [], blocks: [] }; }
+  } catch (e) {
+    // Corrupt ledger: QUARANTINE the evidence and abort loudly — never read "empty" and let a
+    // mutator write a one-entry registry over everyone's reservations and blocks.
+    const quarantine = `${FILE}.corrupt-${Date.now()}`;
+    try { fs.renameSync(FILE, quarantine); } catch { /* best-effort */ }
+    throw new Error(`registry ${FILE} is corrupt (${e.message}) — moved to ${quarantine}; inspect/restore it, then retry`);
+  }
 }
 export function writeRegistry(reg) {
   ensureDir();
   const tmp = `${FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(reg, null, 2));
+  // Write + fsync the temp BEFORE the atomic rename: rename metadata can be journaled ahead of file
+  // data (NTFS/ext4), and a power cut then leaves a zero-length registry.
+  const fd = fs.openSync(tmp, "w");
+  try { fs.writeSync(fd, JSON.stringify(reg, null, 2)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.renameSync(tmp, FILE); // atomic replace
 }
 
@@ -69,16 +115,20 @@ export function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
 }
 
-// Resolves true if `port` can be bound right now (OS-level free). Checks the given host, else all
-// interfaces (strictest — flags anything bound anywhere).
-export function isPortFree(port, host) {
+// Probe a bind, preserving WHY it failed: EADDRINUSE = something holds the port; EACCES/EPERM = the
+// OS forbids binding it at all (Windows excluded port ranges, privileged ports) — nobody can use it.
+export function probePort(port, host) {
   return new Promise((resolve) => {
     const srv = net.createServer();
-    srv.once("error", () => resolve(false));
-    srv.once("listening", () => srv.close(() => resolve(true)));
-    try { host ? srv.listen(port, host) : srv.listen(port); } catch { resolve(false); }
+    srv.once("error", (e) => resolve({ free: false, code: e?.code || null }));
+    srv.once("listening", () => srv.close(() => resolve({ free: true, code: null })));
+    try { host ? srv.listen(port, host) : srv.listen(port); } catch (e) { resolve({ free: false, code: e?.code || null }); }
   });
 }
+const DENIED = new Set(["EACCES", "EACCESS", "EPERM"]); // bind forbidden by the OS — NOT "in use"
+// Resolves true if `port` can be bound right now (OS-level free). Checks the given host, else all
+// interfaces (strictest — flags anything bound anywhere).
+export async function isPortFree(port, host) { return (await probePort(port, host)).free; }
 
 // Drop reservations that are expired or whose owning PID is gone. Returns the removed entries.
 // PID liveness only means something on the machine that made the reservation, so we skip the PID
@@ -109,14 +159,17 @@ export async function reserve(opts = {}) {
   return withLock(async () => {
     const reg = readRegistry();
     reconcile(reg);
+    const me = machineName();
     const blocks = reg.blocks || [];
     // A port is in a FOREIGN block when another project owns a block on THIS machine that spans it.
     // Your own project's block never blocks you (that's the whole point of reserving territory).
+    // Rows/blocks without a .machine are LEGACY entries written by this machine — normalize with `me`
+    // (keying them as `undefined:<port>` made them invisible to the conflict check: double-booking).
     const foreignBlock = (p) =>
-      blocks.find((b) => (b.machine || machine) === machine && b.project !== project && b.rangeStart <= p && p <= b.rangeEnd);
+      blocks.find((b) => (b.machine || me) === machine && b.project !== project && b.rangeStart <= p && p <= b.rangeEnd);
     // Conflicts are PER MACHINE: port 5000 on machine A and on machine B don't collide. `probe` runs the
     // OS-free check locally; a fleet client sets probe:false because it already checked on its own machine.
-    const taken = new Map(reg.reservations.map((r) => [`${r.machine}:${r.port}`, r]));
+    const taken = new Map(reg.reservations.map((r) => [`${r.machine || me}:${r.port}`, r]));
     const key = (p) => `${machine}:${p}`;
     const chosen = [];
     if (port != null) {
@@ -124,28 +177,40 @@ export async function reserve(opts = {}) {
       const fb = foreignBlock(port);
       if (fb) throw new Error(`port ${port} is inside "${fb.project}"'s reserved block ${fb.rangeStart}-${fb.rangeEnd}`);
       // `adopt` registers a port you ALREADY run on (skips the free check). Otherwise it must be free.
-      if (probe && !opts.adopt && !(await isPortFree(port, host))) {
-        throw new Error(`port ${port} is in use at the OS level. Use --adopt if this is your own running service.`);
+      if (probe && !opts.adopt) {
+        touchLock(); // heartbeat — a slow probe must not make us look crashed
+        const pr = await probePort(port, host);
+        if (!pr.free) {
+          throw new Error(DENIED.has(pr.code)
+            ? `port ${port} can't be bound on this OS (an excluded port range — on Windows see \`netsh interface ipv4 show excludedportrange protocol=tcp\` — or a privileged port). --adopt won't help: your server can't bind it either.`
+            : `port ${port} is in use at the OS level. Use --adopt if this is your own running service.`);
+        }
       }
       chosen.push(port);
     } else {
       // Auto-pick. If the caller didn't ask for an explicit range and this project owns block(s) on
       // this machine, hunt WITHIN its own territory (ascending) instead of the default 4000-4999.
       const own = !explicitRange
-        ? blocks.filter((b) => (b.machine || machine) === machine && b.project === project)
+        ? blocks.filter((b) => (b.machine || me) === machine && b.project === project)
             .sort((a, b) => a.rangeStart - b.rangeStart)
         : [];
       const spans = own.length ? own.map((b) => [b.rangeStart, b.rangeEnd]) : [[rangeStart, rangeEnd]];
+      let denied = 0; // ports the OS refuses to let ANYONE bind (excluded ranges / privileged)
       outer: for (const [lo, hi] of spans) {
         for (let p = lo; p <= hi && chosen.length < count; p++) {
-          if (foreignBlock(p)) continue;
-          if (!taken.has(key(p)) && (!probe || (await isPortFree(p, host)))) chosen.push(p);
+          if (foreignBlock(p) || taken.has(key(p))) continue;
+          if (!probe) { chosen.push(p); continue; }
+          touchLock(); // heartbeat: probing a big range is slow — prove we're alive, not crashed
+          const pr = await probePort(p, host);
+          if (pr.free) chosen.push(p);
+          else if (DENIED.has(pr.code)) denied++;
         }
         if (chosen.length >= count) break outer;
       }
       if (chosen.length < count) {
         const where = own.length ? `"${project}"'s block(s)` : `${rangeStart}-${rangeEnd}`;
-        throw new Error(`could not find ${count} free port(s) in ${where}`);
+        throw new Error(`could not find ${count} free port(s) in ${where}` +
+          (denied ? ` (${denied} port(s) there are OS-excluded/privileged — unbindable)` : ""));
       }
     }
     const expiresAt = ttlSec ? new Date(Date.now() + ttlSec * 1000).toISOString() : null;
@@ -162,14 +227,16 @@ export async function reserve(opts = {}) {
 export async function release(opts = {}) {
   const { project, port, id, machine } = opts;
   if (port == null && !project && !id) throw new Error("release requires --port, --project, or --id");
-  // When `machine` is given (fleet clients pass their own), port/project matches are scoped to it so a
-  // client only releases its own holds; `id` is globally unique so it ignores the scope.
+  // Supplied selectors are ANDed — a row goes only if it matches EVERY one — so `--project X --port P`
+  // releases X's hold on P and never another project's P (a union would silently widen the blast
+  // radius). When `machine` is given (fleet clients pass their own), port/project matches are scoped
+  // to it so a client only releases its own holds; `id` is globally unique so it ignores the scope.
   const onMachine = (r) => !machine || r.machine === machine;
   return withLock(async () => {
     const reg = readRegistry();
     const before = reg.reservations.length;
     reg.reservations = reg.reservations.filter(
-      (r) => !((id && r.id === id) || (port != null && r.port === port && onMachine(r)) || (project && r.project === project && onMachine(r)))
+      (r) => !((!id || r.id === id) && (port == null || r.port === port) && (!project || r.project === project) && (!!id || onMachine(r)))
     );
     writeRegistry(reg);
     return before - reg.reservations.length;
@@ -189,6 +256,10 @@ export async function reserveBlock(opts = {}) {
     const reg = readRegistry();
     reconcile(reg);
     const here = (m) => (m || machine) === machine; // missing machine == this machine
+    // IDEMPOTENT under the lock: re-claiming an IDENTICAL block (same project/machine/range) — a re-run
+    // bootstrap, `portbook import`, or two agents racing — returns the existing row, never a duplicate.
+    const dup = reg.blocks.find((b) => here(b.machine) && b.project === project && b.rangeStart === rangeStart && b.rangeEnd === rangeEnd);
+    if (dup) { writeRegistry(reg); return dup; }
     // (a) No overlap with ANOTHER project's block on this machine (your own block overlapping is fine).
     for (const b of reg.blocks) {
       if (!here(b.machine) || b.project === project) continue;
@@ -216,8 +287,9 @@ export async function releaseBlock(opts = {}) {
   return withLock(async () => {
     const reg = readRegistry();
     const before = reg.blocks.length;
+    // Same AND semantics as release(): match every supplied selector; `id` is global (machine-exempt).
     reg.blocks = reg.blocks.filter(
-      (b) => !((id && b.id === id) || (project && b.project === project && (!machine || b.machine === machine)))
+      (b) => !((!id || b.id === id) && (!project || b.project === project) && (!!id || !machine || b.machine === machine))
     );
     writeRegistry(reg);
     return before - reg.blocks.length;
@@ -275,7 +347,10 @@ export async function annotate(rows) {
 export async function check(port, host) {
   if (!validPort(port)) throw new Error(`invalid port ${port} — must be an integer 1-65535`);
   const reg = readRegistry();
-  const reservation = reg.reservations.find((r) => r.port === port) || null;
+  const me = machineName();
+  // Only THIS machine's row (legacy machine-less rows are local) answers a local check — on a fleet
+  // host the ledger holds other machines' rows too, and their ports don't collide with ours.
+  const reservation = reg.reservations.find((r) => r.port === port && (!r.machine || r.machine === me)) || null;
   const osFree = await isPortFree(port, host);
   return { port, reservation, osFree };
 }
@@ -297,11 +372,15 @@ const portOf = (addr) => Number(String(addr).slice(String(addr).lastIndexOf(":")
 
 // `netstat -ano` (Windows). Lines look like: `  TCP    0.0.0.0:135    0.0.0.0:0    LISTENING    1032`.
 // Keep only TCP rows in LISTENING state; PID is the trailing column. No process name from netstat.
+// The state string is LOCALIZED ("ABHÖREN" on German Windows…), so "LISTENING" is only the fast path;
+// the locale-proof tell is the foreign address — a TCP listener's is always 0.0.0.0:0 or [::]:0, while
+// every other TCP state has a real foreign endpoint.
 export function parseNetstat(text) {
   const out = new Map();
   for (const line of String(text).split(/\r?\n/)) {
     const t = line.trim().split(/\s+/);
-    if (t[0] !== "TCP" || !t.includes("LISTENING")) continue;
+    if (t[0] !== "TCP") continue;
+    if (!t.includes("LISTENING") && !/^(0\.0\.0\.0|\[::\]):0$/.test(t[2] || "")) continue;
     const port = portOf(t[1] || "");
     const pid = Number(t[t.length - 1]);
     if (port && !out.has(port)) out.set(port, { port, pid: pid || null, proc: null });
@@ -327,14 +406,18 @@ export function parseSs(text) {
 
 // `lsof -nP -iTCP -sTCP:LISTEN` (macOS/BSD). The first line is a header we skip. Lines look like:
 //   `node    4100 ctk   23u  IPv4 0x... 0t0 TCP 127.0.0.1:4100 (LISTEN)`
-// Command is column 0, PID column 1, the address (with port) column 8.
+// COMMAND may itself contain spaces ("Code Helper (Plugin)" → "Code Help" after lsof's 9-char cut),
+// which shifts naive column splits — so anchor on the invariant tail (-sTCP:LISTEN means every data
+// row ends `TCP <addr> (LISTEN)`), and read PID as the first integer token from the left with the
+// command being everything before it.
 export function parseLsof(text) {
   const out = new Map();
   for (const line of String(text).split(/\r?\n/).slice(1)) {
-    const c = line.trim().split(/\s+/);
-    if (c.length < 9) continue;
-    const port = portOf(c[8] || "");
-    if (port && !out.has(port)) out.set(port, { port, pid: Number(c[1]) || null, proc: c[0] || null });
+    const m = line.match(/\sTCP\s+(\S+)\s+\(LISTEN\)\s*$/);
+    if (!m) continue;
+    const port = portOf(m[1]);
+    const pm = line.match(/^\s*(.+?)\s+(\d+)\s+/); // command (may contain spaces), then the PID
+    if (port && !out.has(port)) out.set(port, { port, pid: pm ? Number(pm[2]) : null, proc: pm ? pm[1] : null });
   }
   return [...out.values()];
 }
@@ -388,7 +471,12 @@ async function posixListeners() {
 //   ghosts    — reserved but nothing is listening (a stale hold, or a server that hasn't started)
 export async function scan() {
   const reg = readRegistry();
-  const reserved = new Map(reg.reservations.map((r) => [r.port, r]));
+  const me = machineName();
+  // Cross-reference only THIS machine's rows (legacy machine-less rows are local). On a fleet host the
+  // ledger holds every machine's rows — a remote reservation must not label a local listener "managed",
+  // and a live remote hold must never surface as a releasable local "ghost".
+  const mine = reg.reservations.filter((r) => !r.machine || r.machine === me);
+  const reserved = new Map(mine.map((r) => [r.port, r]));
   const listeners = await getListeners();
   const seen = new Set();
   const managed = [], unmanaged = [];
@@ -397,6 +485,6 @@ export async function scan() {
     const r = reserved.get(l.port);
     (r ? managed : unmanaged).push({ ...l, reservation: r || null });
   }
-  const ghosts = reg.reservations.filter((r) => !seen.has(r.port));
-  return { machine: os.hostname(), listeners, managed, unmanaged, ghosts };
+  const ghosts = mine.filter((r) => !seen.has(r.port));
+  return { machine: me, listeners, managed, unmanaged, ghosts };
 }

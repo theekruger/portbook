@@ -15,7 +15,15 @@ function parseArgs(argv) {
   }
   return out;
 }
-const num = (v) => (v == null || v === true ? undefined : Number(v));
+const num = (v) => (v == null || v === true ? undefined : Number(v)); // lenient — positionals only
+// Strict numeric flags: garbage like `--ttl 30s` must fail loudly (exit 1), never silently become
+// NaN — which downstream reads as "no ttl/pid", turning a crash-reclaimable hold into a permanent one.
+function requireInt(name, v) {
+  if (v === undefined) return undefined; // flag not given
+  const n = v === true ? NaN : Number(v);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`invalid ${name}: ${v === true ? "missing value" : `"${v}"`} — must be a positive integer`);
+  return n;
+}
 
 const HELP = `portbook — machine-wide port registry (so agents & servers stop colliding)
 
@@ -133,9 +141,12 @@ function fmtScan(res, inRange, blocks = []) {
   return lines.join("\n");
 }
 
+// Strict `--range a-b`: both bounds must be positive integers (e.g. 4200-4299) — anything else exits 1.
 function parseRange(v) {
-  if (typeof v === "string" && v.includes("-")) { const [s, e] = v.split("-"); return [num(s), num(e)]; }
-  return [undefined, undefined];
+  if (v === undefined) return [undefined, undefined];
+  const m = typeof v === "string" ? v.match(/^(\d+)-(\d+)$/) : null;
+  if (!m) throw new Error(`invalid --range: ${v === true ? "missing value" : `"${v}"`} — must be <start>-<end>, e.g. 4200-4299`);
+  return [requireInt("--range start", m[1]), requireInt("--range end", m[2])];
 }
 
 function fmtEnv(e) {
@@ -191,10 +202,10 @@ async function main() {
     if (cmd === "reserve") {
       const [rangeStart, rangeEnd] = parseRange(a.range);
       const made = await reg.reserve({
-        project: a.project, port: num(a.port), count: num(a.count) || 1,
+        project: a.project, port: requireInt("--port", a.port), count: requireInt("--count", a.count) || 1,
         purpose: typeof a.purpose === "string" ? a.purpose : null,
         owner: typeof a.owner === "string" ? a.owner : null,
-        pid: num(a.pid), ttlSec: num(a.ttl), rangeStart, rangeEnd, adopt: !!a.adopt,
+        pid: requireInt("--pid", a.pid), ttlSec: requireInt("--ttl", a.ttl), rangeStart, rangeEnd, adopt: !!a.adopt,
       });
       console.log(a.json ? JSON.stringify(made, null, 2) : made.map((m) => m.port).join("\n"));
       return;
@@ -202,7 +213,7 @@ async function main() {
     if (cmd === "adopt") {
       // Claim a port already taken by an OS/external process. Default project to that process's name
       // (from scan()) and owner to "external" when the caller doesn't override either.
-      const port = num(argv[1]) ?? num(a.port);
+      const port = num(argv[1]) ?? requireInt("--port", a.port);
       if (!port) throw new Error("adopt requires a port, e.g. `portbook adopt 5432 --project postgres`");
       let project = typeof a.project === "string" ? a.project : null;
       if (!project) {
@@ -214,7 +225,7 @@ async function main() {
         project, port, adopt: true,
         purpose: typeof a.purpose === "string" ? a.purpose : null,
         owner: typeof a.owner === "string" ? a.owner : "external",
-        pid: num(a.pid), ttlSec: num(a.ttl),
+        pid: requireInt("--pid", a.pid), ttlSec: requireInt("--ttl", a.ttl),
       });
       console.log(a.json ? JSON.stringify(made, null, 2) : made.map((m) => m.port).join("\n"));
       return;
@@ -245,15 +256,18 @@ async function main() {
         console.log(`released ${n} block(s)`);
         return;
       }
-      const n = await reg.release({ project: a.project, port: num(a.port), id: a.id });
+      const n = await reg.release({ project: a.project, port: requireInt("--port", a.port), id: a.id });
       console.log(`released ${n} reservation(s)`);
       return;
     }
     if (cmd === "list") {
       const rows = await reg.list({ project: a.project }); // await: local list() is sync, remote is async
       const annotated = a["no-probe"] ? rows.map((r) => ({ ...r, bound: null, stale: null })) : await annotate(rows);
+      // --json is ALWAYS a bare array of annotated reservation rows — a stable shape for the
+      // documented `jq '.[] | …'` pipelines. Blocks have their own surface (`portbook blocks --json`);
+      // the human output keeps its BLOCKS section below.
+      if (a.json) { console.log(JSON.stringify(annotated, null, 2)); return; }
       const blocks = await reg.listBlocks({ project: a.project });
-      if (a.json) { console.log(JSON.stringify(blocks.length ? { reservations: annotated, blocks } : annotated, null, 2)); return; }
       const out = [fmt(annotated)];
       if (blocks.length) out.push("", "BLOCKS:", fmtBlocks(blocks));
       console.log(out.join("\n"));
@@ -273,7 +287,7 @@ async function main() {
       return;
     }
     if (cmd === "serve") {
-      const port = num(a.port) || 7800;
+      const port = requireInt("--port", a.port) || 7800;
       const bind = typeof a.bind === "string" ? a.bind : "127.0.0.1";
       const { serve } = await import("../src/server.js");
       await serve({ port, bind });
@@ -288,7 +302,7 @@ async function main() {
       return;
     }
     if (cmd === "check") {
-      const port = num(argv[1]) ?? num(a.port);
+      const port = num(argv[1]) ?? requireInt("--port", a.port);
       if (!port) throw new Error("check requires a port, e.g. `portbook check 4100`");
       console.log(JSON.stringify(await reg.check(port), null, 2));
       return;
@@ -319,11 +333,13 @@ async function main() {
         catch (e) { if (/already reserved on/.test(e?.message || "")) skipped.push(r); else throw e; }
       }
       // Blocks too: the core lets a project overlap its OWN block, so re-importing the same block would
-      // duplicate it — dedupe against what the server already holds for this machine (project + range).
+      // duplicate it — dedupe against what the server already holds (same machine + project + range).
+      // Key on the BLOCK's own machine (importBlock carries `b.machine || me`), not the current one,
+      // so blocks recorded for another machine in a migrated registry stay idempotent across re-runs.
       const localBlocks = listBlocks();
       const onServer = localBlocks.length ? await reg.listBlocks({}) : [];
       const me = machineName();
-      const present = (b) => onServer.some((s) => (s.machine || me) === me && s.project === b.project && s.rangeStart === b.rangeStart && s.rangeEnd === b.rangeEnd);
+      const present = (b) => { const bm = b.machine || me; return onServer.some((s) => (s.machine || me) === bm && s.project === b.project && s.rangeStart === b.rangeStart && s.rangeEnd === b.rangeEnd); };
       const blocksImported = [], blocksSkipped = [];
       for (const b of localBlocks) {
         if (present(b)) { blocksSkipped.push(b); continue; }

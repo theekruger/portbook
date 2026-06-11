@@ -54,7 +54,9 @@ export async function reserve(opts = {}) {
     });
     return Array.isArray(r) ? r[0] : r;
   };
-  const isConflict = (e) => /already reserved on/.test(e?.message || "");
+  // Ledger rejections auto-pick can retry past: someone on this machine grabbed the port between our
+  // snapshot and the commit — as a reservation, or as freshly claimed block territory.
+  const isConflict = (e) => /already reserved on|is inside "[^"]*"'s reserved block/.test(e?.message || "");
 
   if (port != null) {
     if (!adopt && !(await isPortFree(port, host))) throw new Error(`port ${port} is in use on ${machine} at the OS level. Use --adopt if it's your own service.`);
@@ -68,23 +70,31 @@ export async function reserve(opts = {}) {
   const taken = new Set((await get("/api/list?raw=1")).filter((r) => r.machine === machine).map((r) => r.port));
   // Block-aware, mirroring the core: a FOREIGN block (another project's territory on THIS machine)
   // is always skipped; and absent an explicit range, hunt WITHIN this project's own block span(s)
-  // (ascending) instead of the default 4000-4999. Your own block never blocks you.
-  const blocks = (await get("/api/blocks")).filter((b) => (b.machine || machine) === machine);
+  // (ascending) instead of the default 4000-4999. Your own block never blocks you. Machine-less rows
+  // are LEGACY entries owned by the registry HOST (registry.js normalizes them with the server's own
+  // name) — never this client's; if this client IS the host, the server's commit-time territory check
+  // still rejects ("inside … reserved block"), which isConflict treats as a skippable conflict.
+  const blocks = (await get("/api/blocks")).filter((b) => b.machine === machine);
   const foreignBlock = (p) => blocks.find((b) => b.project !== opts.project && b.rangeStart <= p && p <= b.rangeEnd);
   const own = !explicitRange
     ? blocks.filter((b) => b.project === opts.project).sort((a, b) => a.rangeStart - b.rangeStart)
     : [];
   const spans = own.length ? own.map((b) => [b.rangeStart, b.rangeEnd]) : [[rangeStart, rangeEnd]];
   const made = [];
+  // Local reserve() is all-or-nothing (one write under one lock); the fleet path commits per port, so
+  // any failure mid-batch must ROLL BACK the partial commits (best-effort, by global id) before
+  // rethrowing — the caller must never be told "failed" while still holding ports in the shared ledger.
+  const rollback = async () => { for (const m of made) await post("/api/release", { id: m.id }).catch(() => {}); };
   outer: for (const [lo, hi] of spans) {
     for (let p = lo; p <= hi && made.length < count; p++) {
       if (foreignBlock(p) || taken.has(p) || !(await isPortFree(p, host))) continue;
       try { made.push(await commit(p)); taken.add(p); }
-      catch (e) { if (isConflict(e)) { taken.add(p); continue; } throw e; }
+      catch (e) { if (isConflict(e)) { taken.add(p); continue; } await rollback(); throw e; }
     }
     if (made.length >= count) break outer;
   }
   if (made.length < count) {
+    await rollback();
     const where = own.length ? `"${opts.project}"'s block(s)` : `${rangeStart}-${rangeEnd}`;
     throw new Error(`could not find ${count} free port(s) in ${where} on ${machine}`);
   }

@@ -1,7 +1,11 @@
 // Tests for the OS listener-table parsers (pure text/JSON → [{port, pid, proc}]).
 // These run identically on any OS because they feed CAPTURED sample output instead of shelling out,
 // so the Linux/macOS/Windows parsing paths are all exercised regardless of the host platform.
-import { parseSs, parseLsof, parseNetstat, parsePowershell } from "../src/registry.js";
+// Tests must not inherit fleet config (docs/FLEET.md tells users to export these in the profile) —
+// scrub BEFORE importing src modules, hence the dynamic import.
+for (const k of ["PORTBOOK_SERVER", "PORTBOOK_TOKEN", "PORTBOOK_MACHINE"]) delete process.env[k];
+const { parseSs, parseLsof, parseNetstat, parsePowershell } = await import("../src/registry.js");
+const { parseWslList } = await import("../src/environments.js");
 
 let pass = 0, fail = 0;
 const ok = (n, c) => { c ? (pass++, console.log("  PASS " + n)) : (fail++, console.log("  FAIL " + n)); };
@@ -106,6 +110,29 @@ const find = (rows, port) => rows.find((r) => r.port === port);
   // Empty stdout (the `|| "[]"` guard) and an empty array both yield [].
   ok("powershell: empty stdout → []", parsePowershell("").length === 0 && parsePowershell("   ").length === 0);
   ok("powershell: empty array → []", parsePowershell("[]").length === 0);
+}
+
+// ── wsl.exe -l -v (Windows) — raw bytes, encoding sniffed ───────────────────────────────────────────
+{
+  // wsl emits UTF-16LE by default but UTF-8 under WSL_UTF8=1; parseWslList must decode BOTH from the
+  // raw bytes (the old unconditional utf16le decode turned WSL_UTF8=1 output into mojibake → []).
+  const table = [
+    "  NAME                    STATE           VERSION",
+    "* Ubuntu                  Running         2",
+    "  rancher-desktop-data    Stopped         2",
+    "",
+  ].join("\r\n");
+  const w16 = parseWslList(Buffer.from(table, "utf16le"));
+  ok("wsl: decodes default UTF-16LE output", w16.length === 2 && w16[0].name === "Ubuntu" && w16[0].state === "Running" && w16[0].version === 2);
+  ok("wsl: '*' marks the default distro", w16[0].default === true && w16[1].default === false);
+  const w8 = parseWslList(Buffer.from(table, "utf8"));
+  ok("wsl: decodes WSL_UTF8=1 (plain UTF-8) output", w8.length === 2 && w8[1].name === "rancher-desktop-data" && w8[1].state === "Stopped");
+
+  // Localized Windows renders STATE as multiple words (German "Wird ausgeführt") — must still parse.
+  const de = parseWslList(Buffer.from("  NAME      STATUS              VERSION\r\n* Ubuntu    Wird ausgeführt     2\r\n", "utf16le"));
+  ok("wsl: accepts multiword localized states", de.length === 1 && de[0].state === "Wird ausgeführt" && de[0].version === 2);
+
+  ok("wsl: empty/garbage input → [] (no throw)", parseWslList(Buffer.from("", "utf8")).length === 0 && parseWslList(Buffer.from("no distros installed\r\n", "utf16le")).length === 0);
 }
 
 // ── malformed / empty input is skipped, never throws ─────────────────────────────────────────────────

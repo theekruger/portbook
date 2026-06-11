@@ -77,7 +77,9 @@ A block does two things, both per-project and **per machine**:
 
 Blocks are **persistent** — they have no PID or TTL, so `gc` and reconciliation never reclaim them;
 release one explicitly with `portbook release --project api --blocks` (or `--block <id>`). List them
-with `portbook blocks` (or `portbook block --project api` for one project's). Your own project's block
+with `portbook blocks` (add `--json` for scripts; `portbook block --project api` for one project's) —
+`portbook list --json` stays a plain array of reservations, so claiming territory never changes the
+shape your scripts parse. Your own project's block
 never blocks *you* — overlapping or reserving inside your own territory is always fine; that's the
 whole point of claiming it.
 
@@ -109,7 +111,7 @@ Tailscale IP (`--bind`) and the very same process becomes the shared registry fo
 
 ## How it works
 - **Storage:** one JSON at `~/.portbook/registry.json` (override with `PORTBOOK_DIR`). Each entry records who/why/PID/TTL plus the `machine` (hostname) that holds it.
-- **Concurrency-safe:** an atomic `mkdir` lock serializes reserve/release across processes; writes are atomic (temp + rename); a stale lock (>15s) is reclaimed automatically.
+- **Concurrency-safe:** an atomic `mkdir` lock serializes reserve/release across processes. The holder stamps the lock with an owner token and heartbeats it while it works, so releases only ever remove the holder's own lock — and a crashed holder's lock (no heartbeat for >15s) is taken over atomically by exactly one waiter. Writes are atomic (temp + rename).
 - **OS-reconciled:** `reserve` verifies a port is genuinely free at the OS level before granting; `list`/`scan` read the live listener table to show what's truly bound; `gc` (and every `reserve`) reclaims reservations whose PID is dead or whose TTL expired. `list`/`scan` never mutate — only `reserve`/`release`/`gc` do.
 
 ## For AI agents
@@ -120,7 +122,8 @@ Drive portbook from the tools you already use — all thin clients over the same
 Full guide: **[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)**.
 
 - **AI agent harnesses** (Claude Code, Codex, Cursor, Windsurf, Hermes) — the **MCP server**: `portbook mcp`
-  speaks JSON-RPC over stdio and exposes `reserve`/`release`/`list`/`check`/`scan`/`ecosystem`/`gc` as tools.
+  speaks JSON-RPC over stdio and exposes `reserve`/`release`/`list`/`check`/`scan`/`ecosystem`/`gc` —
+  plus the block-territory tools `reserve_block`/`list_blocks`/`release_block` — as tools.
   Config + per-client setup in [integrations/mcp/](integrations/mcp/) (e.g. `claude mcp add portbook -- portbook mcp`).
 - **VS Code / Cursor / Windsurf** — a thin, buildless extension (status bar + live Ports view): [integrations/vscode/](integrations/vscode/).
 - **Zed** — task recipes that call the CLI: [integrations/zed/](integrations/zed/).
