@@ -151,7 +151,8 @@ Full guide: **[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)**.
   plus the block-territory tools `reserve_block`/`list_blocks`/`release_block` and the negotiation
   tools `request_port`/`inbox`/`my_requests`/`grant_request`/`deny_request` — as tools.
   Config + per-client setup in [integrations/mcp/](integrations/mcp/) (e.g. `claude mcp add portbook -- portbook mcp`).
-- **VS Code / Cursor / Windsurf** — a thin, buildless extension (status bar + live Ports view): [integrations/vscode/](integrations/vscode/).
+- **VS Code / Cursor / Windsurf** — a thin, buildless extension (status bar + live Ports view), on the
+  Marketplace as [`portbook.portbook`](https://marketplace.visualstudio.com/items?itemName=portbook.portbook): [integrations/vscode/](integrations/vscode/).
 - **Zed** — task recipes that call the CLI: [integrations/zed/](integrations/zed/).
 - **JetBrains** (IntelliJ/PyCharm/WebStorm/…) — External Tools entries: [integrations/jetbrains/](integrations/jetbrains/).
 - **Anything else** — the HTTP API (`portbook serve`) + the `--json` CLI.

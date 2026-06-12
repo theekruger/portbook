@@ -36,6 +36,20 @@ affordance instead of an error.
 
 ## Install
 
+### From the Marketplace (recommended)
+
+The extension is published as
+[`portbook.portbook`](https://marketplace.visualstudio.com/items?itemName=portbook.portbook):
+search **"portbook"** in the Extensions view, or run `ext install portbook.portbook` from the
+Command Palette, or:
+
+```bash
+code --install-extension portbook.portbook
+```
+
+(Cursor and Windsurf users: install from the bundled `.vsix` below or via Open VSX when available —
+their extension views use a different registry.)
+
 ### Run from source (no build step)
 
 1. Open **this folder** (`integrations/vscode`) in VS Code / Cursor / Windsurf.
