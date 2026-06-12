@@ -13,8 +13,12 @@ When several projects and several agents run servers on one machine, they grab p
 
 ## Install
 ```bash
-git clone <repo> portbook && cd portbook
-npm link        # puts `portbook` on your PATH (no dependencies; Node >= 18)
+npm install -g portbook        # zero dependencies; Node >= 18
+```
+Or from source:
+```bash
+git clone https://github.com/theekruger/portbook && cd portbook
+npm link        # same thing, your checkout on PATH
 ```
 
 ## Use
