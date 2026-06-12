@@ -8,7 +8,7 @@ surface fits the tool:
 |--------------------------------------------|-------------------------------|---------------------------------------|
 | An MCP agent (Claude Code, Codex, Cursor, Windsurf, Hermes) | **MCP server** (`portbook mcp`) | [`integrations/mcp/`](../integrations/mcp/)         |
 | VS Code (or Cursor / Windsurf, both VS Code forks) | **VS Code extension**         | [`integrations/vscode/`](../integrations/vscode/)   |
-| Zed                                        | **Zed tasks** (CLI)           | [`integrations/zed/`](../integrations/zed/)         |
+| Zed                                        | **MCP (Agent Panel)** + tasks | [`integrations/zed/`](../integrations/zed/)         |
 | JetBrains IDEs (IntelliJ, WebStorm, …)     | **External Tools** (CLI)      | [`integrations/jetbrains/`](../integrations/jetbrains/) |
 | Anything else / scripts / dashboards       | **HTTP API + CLI**            | `portbook serve` · `portbook` on PATH |
 

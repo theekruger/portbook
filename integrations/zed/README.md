@@ -1,11 +1,53 @@
 # portbook × Zed
 
-Run portbook from inside [Zed](https://zed.dev) via its built-in **task** system + the `portbook`
-CLI. Zed can't render a custom panel yet, so tasks + the CLI is the pragmatic path: each task just
-shells out to a `portbook` subcommand and shows the output in an integrated terminal.
+Two complementary surfaces:
 
-> Prereq: the `portbook` CLI must be on your `PATH` (from the repo root: `npm link`). Verify with
-> `portbook where`.
+- **Agent Panel via MCP (recommended)** — Zed speaks the Model Context Protocol, so its AI agent can
+  drive portbook directly: reserve before binding, check/scan, claim territory, and answer port
+  requests — all as first-class tools.
+- **Tasks** — one-keystroke `portbook` commands for *you*, in an integrated terminal.
+
+> Prereq for both: the `portbook` CLI must be on your `PATH` (`npm install -g portbook`, or from the
+> repo root: `npm link`). Verify with `portbook where`.
+
+## Agent Panel (MCP)
+
+Add portbook as a context server in your Zed `settings.json` (`zed: open settings`):
+
+```jsonc
+{
+  "context_servers": {
+    "portbook": {
+      "source": "custom",          // required — Zed silently skips entries without it
+      "command": "portbook",
+      "args": ["mcp"],
+      "env": {}
+    }
+  }
+}
+```
+
+On **Windows**, if Zed fails to spawn the `portbook` shim, point at node + the script directly:
+
+```jsonc
+{
+  "context_servers": {
+    "portbook": {
+      "source": "custom",
+      "command": "node",
+      "args": ["C:\\path\\to\\portbook\\bin\\portbook.js", "mcp"],
+      "env": {}
+    }
+  }
+}
+```
+
+Verify: Agent Panel → settings — the dot next to **portbook** should be green ("Server is active").
+The agent then has all fifteen tools (`reserve`, `release`, `list`, `check`, `scan`, `ecosystem`,
+`gc`, the `*_block` territory tools, and the `request_port`/`inbox`/`my_requests`/`grant_request`/
+`deny_request` negotiation tools — see [integrations/mcp/](../mcp/)). Pair it with the agent
+etiquette in [AGENTS.md](../../AGENTS.md) (drop it into your Zed rules) so the agent *reserves before
+it binds* and *asks instead of killing* what's on a port.
 
 ## Install
 
@@ -44,8 +86,7 @@ tasks the same way.
 
 ## Roadmap
 
-These tasks are CLI-only and zero-dependency. A future, richer integration would be a proper **Zed
-extension** that talks to the portbook HTTP API instead of shelling out — e.g. polling
-`GET /api/ecosystem` (from `portbook serve`) to render live port state inline, and `POST /api/reserve`
-/ `POST /api/release` for one-click reserve/release. See the repo README and `docs/FLEET.md` for the
-server/API surface.
+MCP (above) covers the agent side natively. A future, richer *visual* integration would be a proper
+**Zed extension** — packaging the context server for one-click install from Zed's extension registry,
+and/or polling `GET /api/ecosystem` (from `portbook serve`) to render live port state inline. See the
+repo README and `docs/FLEET.md` for the server/API surface.
