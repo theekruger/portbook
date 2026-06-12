@@ -55,8 +55,11 @@ export async function reserve(opts = {}) {
     return Array.isArray(r) ? r[0] : r;
   };
   // Ledger rejections auto-pick can retry past: someone on this machine grabbed the port between our
-  // snapshot and the commit — as a reservation, or as freshly claimed block territory.
-  const isConflict = (e) => /already reserved on|is inside "[^"]*"'s reserved block/.test(e?.message || "");
+  // snapshot and the commit — as a reservation, as freshly claimed block territory, or as a port
+  // mid-handover (granted to another project, unconsumed). The /api/list snapshot can't see promises
+  // (the grant already released the holder's row), so the commit-time rejection IS the guard here —
+  // mirroring the core auto-pick's `promised` skip, instead of aborting the whole batch.
+  const isConflict = (e) => /already reserved on|is inside "[^"]*"'s reserved block|is granted to "/.test(e?.message || "");
 
   if (port != null) {
     if (!adopt && !(await isPortFree(port, host))) throw new Error(`port ${port} is in use on ${machine} at the OS level. Use --adopt if it's your own service.`);
@@ -178,6 +181,32 @@ export async function importReservation(r) {
     purpose: r.purpose ?? null, owner: r.owner ?? null, pid: r.pid ?? null,
   });
   return Array.isArray(out) ? out[0] : out;
+}
+
+// ── Port REQUESTS against the shared ledger (ask the holder instead of clobbering — see registry.js).
+// The server resolves the holder and answers under its lock; the client only attaches THIS machine's
+// identity wherever the core would default it to its own (which machine's port is being asked about;
+// which box scopes the inbox). Same export names as the registry's, so bin's `reg` routing works.
+export async function requestPort(opts = {}) {
+  return post("/api/requests", { ...opts, machine: opts.machine || machineName() });
+}
+
+// The asks awaiting `project`'s answer on THIS machine (every project's when omitted).
+export async function inbox(opts = {}) {
+  return get(`/api/requests?machine=${encodeURIComponent(opts.machine || machineName())}` +
+    (opts.project ? `&project=${encodeURIComponent(opts.project)}` : ""));
+}
+
+// The requester's view: everything `fromProject` has filed, all statuses, newest first (server-side).
+export async function outbox(opts = {}) {
+  if (!opts.fromProject) throw new Error("outbox requires a --project (whose filings to show)");
+  return get(`/api/requests?from=${encodeURIComponent(opts.fromProject)}`);
+}
+
+// The holder answers a pending ask by id (global — no machine). A grant also releases the holder's
+// reservation in the server's own locked write, so the handover is ledger-snipe-free (see registry.js).
+export async function resolveRequest(opts = {}) {
+  return post("/api/requests/resolve", opts);
 }
 
 // Push this machine's full ecosystem (host ports + containers + WSL) to the server so the fleet view /

@@ -14,9 +14,10 @@ surface fits the tool:
 
 All of these are thin clients over the **zero-dependency** core (`src/registry.js` +
 `src/environments.js`). None of them change the registry's behavior — they just surface
-reserve / release / list / check / scan / ecosystem / gc (and port-territory blocks) where you work. The etiquette every agent
-should follow (reserve before you bind, release on stop, record the PID) is in
-[AGENTS.md](../AGENTS.md).
+reserve / release / list / check / scan / ecosystem / gc (plus port-territory blocks and
+request/grant **negotiation**) where you work. The etiquette every agent
+should follow (reserve before you bind, release on stop, record the PID, ask — never kill — when a
+port you want is held) is in [AGENTS.md](../AGENTS.md).
 
 ## Adopting portbook in a harness you don't control
 
@@ -25,7 +26,7 @@ outside, through configuration you already own. In rough order of preference:
 
 1. **MCP (works almost everywhere).** MCP servers are **user-configured**, not vendor-shipped: drop
    the [`mcp.json`](../integrations/mcp/mcp.json) block into the harness's MCP settings and it gains
-   portbook's ten tools — no cooperation from the harness's author required. Claude Code, Codex,
+   portbook's fifteen tools — no cooperation from the harness's author required. Claude Code, Codex,
    Cursor, Windsurf, Copilot CLI, and effectively every modern agent harness speak MCP.
 2. **ACP editors get it for free, via MCP.** The [Agent Client Protocol](https://agentclientprotocol.com)
    connects editors (Zed, JetBrains AI Assistant, Neovim plugins) to any ACP agent — and when an ACP
@@ -48,9 +49,12 @@ binds.
 ## MCP server
 
 For any **MCP-aware** harness. The client spawns `portbook mcp` and talks
-newline-delimited JSON-RPC 2.0 over stdio; the server exposes ten tools —
-`reserve`, `release`, `list`, `check`, `scan`, `ecosystem`, `gc`, plus the block-territory tools
-`reserve_block`, `list_blocks`, `release_block` — mirroring the library and HTTP APIs.
+newline-delimited JSON-RPC 2.0 over stdio; the server exposes fifteen tools —
+`reserve`, `release`, `list`, `check`, `scan`, `ecosystem`, `gc`, the block-territory tools
+`reserve_block`, `list_blocks`, `release_block`, and the port-negotiation tools `request_port`,
+`inbox`, `my_requests`, `grant_request`, `deny_request` (ask for a held port; the holder grants —
+releasing the hold, or opening a one-shot exemption through its block — or denies with a note) —
+mirroring the library and HTTP APIs.
 
 Ready-to-copy config and per-harness setup blocks (Claude Code, Codex, Cursor, Windsurf, Hermes, and
 a generic stdio entry) are in **[integrations/mcp/](../integrations/mcp/)**:
@@ -88,7 +92,8 @@ language — talk to portbook directly.
 ### CLI
 
 `portbook` is on your `PATH` after `npm link`. Add `--json` to `reserve`/`list`/`blocks`/`scan`/`env`
-for machine-readable output (`check` is always JSON). `list --json` is always a plain **array** of
+— and the negotiation commands `request`/`inbox`/`requests`/`grant`/`deny` — for machine-readable
+output (`check` is always JSON). `list --json` is always a plain **array** of
 reservations — port territories have their own surface, `portbook blocks --json`:
 
 ```bash
@@ -116,10 +121,13 @@ browser dashboard can call it.
 | `GET /api/check/:port`     | port in path                          | `{ port, reservation, osFree }` |
 | `GET /api/fleet`           | —                                     | `{ server, at, reservations, blocks, reports }` — every machine's holds + latest reports |
 | `GET /api/blocks`          | `?project=<name>` (optional)          | port-territory blocks (every machine's) |
+| `GET /api/requests`        | `?project=<name>` → that project's pending **inbox**; `?from=<name>` (alone — `?project=` wins if both are sent) → that requester's **outbox** (all statuses, newest first); `?machine=<m>` scopes the inbox (fleet clients pass their own); no params → every pending ask | pending requests / the requester's filings |
 | `POST /api/reserve`        | JSON body = reserve opts (`project` required; `machine`/`probe` for fleet) | the reservation(s) made |
 | `POST /api/release`        | JSON body `{ port \| project \| id, machine? }` | `{ released: <count> }` |
 | `POST /api/blocks`         | JSON body `{ project, rangeStart, rangeEnd, owner?, purpose?, machine? }` | the block made |
 | `POST /api/blocks/release` | JSON body `{ id \| project, machine? }` | `{ released: <count> }` |
+| `POST /api/requests`       | JSON body `{ port, fromProject, fromOwner?, reason?, machine? }` — ask for a **held** port instead of clobbering | the request filed (`status: "pending"`; re-filing an identical pending ask returns the existing row) |
+| `POST /api/requests/resolve` | JSON body `{ id, action: "grant" \| "deny", note? }` — the holder answers an ask from its inbox | the resolved request, plus `releasedReservation` (a grant released the holder's reservation vs. issued a one-shot block exemption) |
 | `POST /api/gc`             | —                                     | `{ reclaimed: <count> }` — a count (the library/MCP `gc` return the removed entries instead) |
 | `POST /api/report`         | JSON body `{ machine, ecosystem }`    | `{ ok, machines }` — a machine pushes its ecosystem to the fleet view |
 

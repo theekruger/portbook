@@ -8,7 +8,7 @@
 // Zero dependencies: just the registry/environment functions and node streams.
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { reserve, release, list, check, gc, scan, annotate, reserveBlock, releaseBlock, listBlocks } from "./registry.js";
+import { reserve, release, list, check, gc, scan, annotate, reserveBlock, releaseBlock, listBlocks, requestPort, inbox, outbox, resolveRequest } from "./registry.js";
 import { ecosystem } from "./environments.js";
 
 // serverInfo reports the REAL package version, read once at load — a hardcoded literal here sat at
@@ -135,6 +135,70 @@ const TOOLS = [
       },
     },
     run: (a) => releaseBlock(a),
+  },
+  // Port REQUESTS (negotiation): mirrors requestPort/inbox/outbox/resolveRequest 1:1, same as the
+  // CLI's `portbook request/inbox/requests/grant/deny`. The flow that stops agents clobbering each
+  // other: ask through the ledger → the holder answers → a grant hands the port over (or opens a
+  // one-shot exemption through the holder's block) that the requester's `reserve` then consumes.
+  {
+    name: "request_port",
+    description: "A port you need is held by ANOTHER project — ask for it instead of killing their server or stealing the port. Files a request the holder sees in their inbox and answers with grant_request/deny_request; once granted, the port is held for you to `reserve`. Idempotent: re-filing the same pending ask returns the existing request.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        port: { ...port, description: "The held port you want (required)." },
+        fromProject: { type: "string", description: "Your project — who is asking (required)." },
+        fromOwner: { type: "string", description: "Who files it (e.g. an agent name)." },
+        reason: { type: "string", description: "Why you need this port — shown in the holder's inbox." },
+      },
+      required: ["port", "fromProject"],
+    },
+    run: (a) => requestPort(a),
+  },
+  {
+    name: "inbox",
+    description: "Pending requests from other projects for ports YOU hold (reservations or blocks). Check it before assuming a port dispute — someone may be asking politely; answer each with grant_request or deny_request.",
+    inputSchema: {
+      type: "object",
+      properties: { project: { type: "string", description: "Only requests targeting this project's holds." } },
+    },
+    run: (a) => inbox(a),
+  },
+  {
+    name: "my_requests",
+    description: "Your outbox: every request your project has filed, all statuses, newest first. Poll it after request_port — a granted, unconsumed row means the port is being held for you: claim it with `reserve`.",
+    inputSchema: {
+      type: "object",
+      properties: { fromProject: { type: "string", description: "Your project — whose filings to show (required)." } },
+      required: ["fromProject"],
+    },
+    run: (a) => outbox(a),
+  },
+  {
+    name: "grant_request",
+    description: "Approve a pending request (an id from inbox): releases your reservation on that port — or issues a one-shot exemption through your block — and holds the port for the requester until they reserve it. Use when you can move, or no longer need the port.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The request id, from inbox (required)." },
+        note: { type: "string", description: "Verdict note shown in the requester's outbox." },
+      },
+      required: ["id"],
+    },
+    run: (a) => resolveRequest({ ...a, action: "grant" }),
+  },
+  {
+    name: "deny_request",
+    description: "Refuse a pending request (an id from inbox): you keep the port; the requester reads the verdict and your note in their outbox. Use when the port must stay yours — add a note suggesting an alternative.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The request id, from inbox (required)." },
+        note: { type: "string", description: "Verdict note shown in the requester's outbox." },
+      },
+      required: ["id"],
+    },
+    run: (a) => resolveRequest({ ...a, action: "deny" }),
   },
 ];
 const TOOL_BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));

@@ -13,6 +13,7 @@ for (const k of ["PORTBOOK_SERVER", "PORTBOOK_TOKEN", "PORTBOOK_MACHINE"]) delet
 
 process.env.PORTBOOK_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "portbook-mcp-test-"));
 const { runMcpServer } = await import("../src/mcp.js");
+const { reserve: seedReserve } = await import("../src/registry.js"); // to seed holders for the request flow
 const PKG = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 let pass = 0, fail = 0;
@@ -71,6 +72,7 @@ const names = (listed.result?.tools || []).map((t) => t.name);
 ok("tools/list responds to the right id (notification produced no reply)", listed.id === 4);
 ok("tools/list contains reserve and ecosystem", names.includes("reserve") && names.includes("ecosystem"));
 ok("tools/list contains the block territory tools", ["reserve_block", "list_blocks", "release_block"].every((n) => names.includes(n)));
+ok("tools/list contains the request negotiation tools", ["request_port", "inbox", "my_requests", "grant_request", "deny_request"].every((n) => names.includes(n)));
 ok("each tool has an object inputSchema", (listed.result?.tools || []).every((t) => t.inputSchema?.type === "object"));
 
 // 3) tools/call name="ecosystem"
@@ -113,7 +115,50 @@ send({ jsonrpc: "2.0", id: 13, method: "tools/call", params: { name: "release_bl
 const noSel = await next();
 ok("release_block with no selector is a tool error", noSel.result?.isError === true);
 
-// 7) JSON-RPC batches: each element answered, replies emitted as ONE array (was: silently dropped)
+// 7) request negotiation round-trip: seed a holder via the registry (probe:false — the ledger, not
+// the OS, is under test), then request_port -> inbox -> grant_request over MCP. The grant must
+// release the holder's reservation in the SAME write; re-resolving must fail.
+await seedReserve({ project: "mcp-holder", port: 45901, purpose: "request-flow seed", probe: false });
+send({ jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "request_port", arguments: {
+  port: 45901, fromProject: "mcp-asker", fromOwner: "mcp-test", reason: "need the canonical port" } } });
+const filed = callResult(await next());
+ok("request_port files a pending request at the holder", filed.status === "pending" && filed.targetProject === "mcp-holder" && filed.fromProject === "mcp-asker");
+send({ jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "inbox", arguments: { project: "mcp-holder" } } });
+const ib = callResult(await next());
+ok("inbox shows the pending ask with its reason", ib.length === 1 && ib[0].id === filed.id && ib[0].reason === "need the canonical port");
+send({ jsonrpc: "2.0", id: 32, method: "tools/call", params: { name: "my_requests", arguments: { fromProject: "mcp-asker" } } });
+ok("my_requests (outbox) lists the filing as pending", callResult(await next()).some((q) => q.id === filed.id && q.status === "pending"));
+send({ jsonrpc: "2.0", id: 33, method: "tools/call", params: { name: "grant_request", arguments: { id: filed.id, note: "take it" } } });
+const granted = callResult(await next());
+ok("grant_request grants and reports the released reservation", granted.status === "granted" && granted.releasedReservation === true && granted.note === "take it");
+send({ jsonrpc: "2.0", id: 34, method: "tools/call", params: { name: "list", arguments: { project: "mcp-holder" } } });
+ok("the holder's reservation is gone after the grant", callResult(await next()).length === 0);
+send({ jsonrpc: "2.0", id: 35, method: "tools/call", params: { name: "grant_request", arguments: { id: filed.id } } });
+ok("re-resolving an already-granted request is a tool error", (await next()).result?.isError === true);
+// deny leg: a second holder + ask, refused with a note the asker reads in their outbox
+await seedReserve({ project: "mcp-holder2", port: 45902, purpose: "deny-leg seed", probe: false });
+send({ jsonrpc: "2.0", id: 36, method: "tools/call", params: { name: "request_port", arguments: {
+  port: 45902, fromProject: "mcp-asker", reason: "second ask" } } });
+const filed2 = callResult(await next());
+send({ jsonrpc: "2.0", id: 37, method: "tools/call", params: { name: "deny_request", arguments: { id: filed2.id, note: "mine at 7pm" } } });
+const denied = callResult(await next());
+ok("deny_request marks it denied and keeps the reservation", denied.status === "denied" && denied.releasedReservation === false);
+send({ jsonrpc: "2.0", id: 38, method: "tools/call", params: { name: "my_requests", arguments: { fromProject: "mcp-asker" } } });
+const verdicts = callResult(await next());
+ok("the verdict + note land in the asker's outbox", verdicts.find((q) => q.id === filed2.id)?.status === "denied" && verdicts.find((q) => q.id === filed2.id)?.note === "mine at 7pm");
+// allowlist on the request tools, same guard as the reserve smuggle test above: `machine` (which
+// would file the ask against another box / forge attribution) and `action` (which would flip a
+// deny into a grant) are not declared, so both must be stripped before dispatch.
+await seedReserve({ project: "mcp-holder3", port: 45903, purpose: "smuggle-leg seed", probe: false });
+send({ jsonrpc: "2.0", id: 39, method: "tools/call", params: { name: "request_port", arguments: {
+  port: 45903, fromProject: "mcp-asker", machine: "evil-box" } } });
+const filed3 = callResult(await next()); // unstripped, this would error: nothing holds 45903 on evil-box
+ok("smuggled machine on request_port is ignored — the ask files on THIS machine", filed3.status === "pending" && filed3.targetMachine === os.hostname());
+send({ jsonrpc: "2.0", id: 40, method: "tools/call", params: { name: "deny_request", arguments: { id: filed3.id, action: "grant", note: "no" } } });
+const denied3 = callResult(await next());
+ok("smuggled action cannot flip deny_request into a grant", denied3.status === "denied" && denied3.releasedReservation === false);
+
+// 8) JSON-RPC batches: each element answered, replies emitted as ONE array (was: silently dropped)
 send([
   { jsonrpc: "2.0", id: 20, method: "ping" },
   { jsonrpc: "2.0", method: "notifications/initialized" }, // notification inside a batch: no reply
@@ -132,7 +177,7 @@ ok("a notification-only batch produces no reply", (await next()).id === 22);
 input.end(); // ends the server's input stream -> runMcpServer resolves
 await done;
 
-// 8) abrupt harness death: a stream 'error' (what a real stdio Socket emits on EPIPE/read failure)
+// 9) abrupt harness death: a stream 'error' (what a real stdio Socket emits on EPIPE/read failure)
 // must resolve the server, not crash the process with an unhandled 'error' event.
 {
   const in2 = new PassThrough(), out2 = new PassThrough();
@@ -142,7 +187,7 @@ await done;
   await done2;
   ok("stream 'error' events resolve the server instead of crashing", true);
 }
-// 9) a reply written after the output side is destroyed is swallowed, never thrown
+// 10) a reply written after the output side is destroyed is swallowed, never thrown
 {
   const in3 = new PassThrough(), out3 = new PassThrough();
   const done3 = runMcpServer({ input: in3, output: out3 });

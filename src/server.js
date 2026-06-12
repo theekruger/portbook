@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { reserve, release, gc, list, check, scan, annotate, machineName, reserveBlock, releaseBlock, listBlocks } from "./registry.js";
+import { reserve, release, gc, list, check, scan, annotate, machineName, reserveBlock, releaseBlock, listBlocks, requestPort, inbox, outbox, resolveRequest } from "./registry.js";
 import { ecosystem } from "./environments.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -107,11 +107,24 @@ export function createServer() {
         const project = url.searchParams.get("project") || undefined;
         return send(res, 200, listBlocks({ project }));
       }
+      // Port REQUESTS (ask/grant/deny — see registry.js): ?project= → that project's inbox; ?from= →
+      // the requester's outbox; neither → every pending ask. ?machine= scopes the inbox to the FLEET
+      // CLIENT's box (the core defaults to the server's own machine — wrong from another machine).
+      if (req.method === "GET" && p === "/api/requests") {
+        const project = url.searchParams.get("project") || undefined;
+        const from = url.searchParams.get("from") || undefined;
+        const machine = url.searchParams.get("machine") || undefined;
+        return send(res, 200, !project && from ? outbox({ fromProject: from }) : inbox({ project, machine }));
+      }
 
       if (req.method === "POST" && p === "/api/reserve") return send(res, 200, await reserve(await readBody(req)));
       if (req.method === "POST" && p === "/api/release") return send(res, 200, { released: await release(await readBody(req)) });
       if (req.method === "POST" && p === "/api/blocks") return send(res, 200, await reserveBlock(await readBody(req)));
       if (req.method === "POST" && p === "/api/blocks/release") return send(res, 200, { released: await releaseBlock(await readBody(req)) });
+      // Requests: file an ask / answer one. The body carries `machine` from fleet clients (which
+      // machine's port is being asked about); resolve is global by request id, no machine needed.
+      if (req.method === "POST" && p === "/api/requests") return send(res, 200, await requestPort(await readBody(req)));
+      if (req.method === "POST" && p === "/api/requests/resolve") return send(res, 200, await resolveRequest(await readBody(req)));
       if (req.method === "POST" && p === "/api/gc") return send(res, 200, { reclaimed: (await gc()).length });
       if (req.method === "POST" && p === "/api/report") {
         const b = await readBody(req);

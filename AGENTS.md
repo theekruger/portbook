@@ -32,9 +32,19 @@ rule that prevents incidents like one agent silently killing another project's r
    **container**, plus WSL distros), so use them to find collisions and unmanaged services; `adopt`
    one to bring it into the registry. If you see stale entries, `portbook gc` reclaims dead/expired
    ones. `portbook serve` opens a live web dashboard of all of the above.
-6. **Scripting?** Add `--json` to `reserve`/`list` (and `check` is always JSON) so you can parse the
-   result instead of scraping columns — e.g. `portbook list --json` gives each port's `bound`/`stale`
-   state.
+6. **Never free a port by killing what's on it.** If a port you need is HELD by another project
+   (reserved, or inside its block), do not kill its process and do not grab the port — **ask**:
+   ```bash
+   portbook request --port <p> --from <your-project> --reason "<why you need it>"
+   ```
+   Poll `portbook requests --from <your-project>` and proceed only when the verdict is **granted** —
+   the port is then held for you; claim it with a normal `reserve`. A **denied** verdict (read the
+   holder's note) means pick another port. The flip side: when you hold contested ports, check
+   `portbook inbox --project <your-project>` at natural pauses and answer each ask with
+   `portbook grant <id>` or `portbook deny <id> [--note "..."]`.
+7. **Scripting?** Add `--json` to `reserve`/`list`/`inbox`/`requests` (and `check` is always JSON) so
+   you can parse the result instead of scraping columns — e.g. `portbook list --json` gives each
+   port's `bound`/`stale` state.
 
 ## Known reserved blocks (do not bind these unless they're yours)
 List your project's long-lived ports — or the **range** it owns — here as you adopt them. Prefer

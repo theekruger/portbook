@@ -33,8 +33,27 @@ and the [HTTP API](../../docs/INTEGRATIONS.md#raw-http-api--cli) one-for-one):
 | `ecosystem` | Whole-machine view: host ports + containers + WSL.           | — |
 | `gc`        | Reclaim dead-PID / expired reservations.                     | — |
 
-> Reservation etiquette for agents (reserve before you bind, release on stop, record the PID) is in
-> the top-level [AGENTS.md](../../AGENTS.md).
+**Port territory** (claim a range per project — see the [README](../../README.md#port-territory-blocks)):
+
+| Tool            | Does                                                       | Key arguments |
+|-----------------|------------------------------------------------------------|---------------|
+| `reserve_block` | Claim a contiguous port range as a project's territory.    | `project`, `rangeStart`, `rangeEnd` (all required), `owner`, `purpose` |
+| `release_block` | Release block(s) by id or project.                         | one of `id` \| `project` |
+| `list_blocks`   | List port-territory blocks (optionally one project's).     | `project` |
+
+**Negotiation** (a port you need is held by another project — *ask* instead of killing it; see
+[CUBICLES.md](../../docs/CUBICLES.md)):
+
+| Tool            | Does                                                        | Key arguments |
+|-----------------|-------------------------------------------------------------|---------------|
+| `request_port`  | File a request against the project holding a port.         | `port`, `fromProject` (required), `fromOwner`, `reason` |
+| `inbox`         | Pending requests targeting your project's holds.           | `project` |
+| `my_requests`   | Requests *you* filed, with their grant/deny status.        | `fromProject` (required) |
+| `grant_request` | Grant: releases the holder's reservation (held for the requester) or issues a one-shot block exemption. | `id` (required), `note` |
+| `deny_request`  | Deny, with an optional explanatory note.                   | `id` (required), `note` |
+
+> Reservation etiquette for agents (reserve before you bind, release on stop, record the PID, ask
+> instead of kill) is in the top-level [AGENTS.md](../../AGENTS.md).
 
 ## Client configuration
 

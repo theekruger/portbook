@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { reserve, release, list, check, gc, scan, annotate, machineName, FILE, reserveBlock, releaseBlock, listBlocks, blockAt } from "../src/registry.js";
+import { reserve, release, list, check, gc, scan, annotate, machineName, FILE, reserveBlock, releaseBlock, listBlocks, blockAt, requestPort, inbox, outbox, resolveRequest } from "../src/registry.js";
 import { ecosystem } from "../src/environments.js";
 
 function parseArgs(argv) {
@@ -35,6 +35,12 @@ Usage:
   portbook adopt <port> [--project <p>] [--owner <o>] [--purpose "..."]  # claim a running OS/external port
   portbook block --project <name> --range <a-b> [--owner <o>] [--purpose "..."]  # claim a port territory
   portbook block --project <name> | portbook blocks [--json]   # list reserved port blocks
+  portbook request --port <p> --from <project> [--owner <o>] [--reason "..."] [--json]
+                                                            # a port you need is HELD — ask, don't clobber
+  portbook inbox [--project <p>] [--json]                   # pending requests against YOUR holds
+  portbook requests --from <project> [--json]               # requests you filed, with verdicts (outbox)
+  portbook grant <id> [--note "..."] [--json]               # hand the port over / exempt through your block
+  portbook deny <id> [--note "..."] [--json]                # refuse it (your note lands in their outbox)
   portbook list [--project <name>] [--json] [--no-probe]    # reserved ports + live OS state
   portbook scan [--range <a-b>] [--json]                    # what's ACTUALLY listening on this machine
   portbook env [--json]                                     # full ecosystem: host + containers + WSL
@@ -47,14 +53,16 @@ Usage:
   portbook import [--json]                                  # migrate this machine's LOCAL reservations into the fleet server
   portbook where                                            # print the registry file path (or server URL in fleet mode)
 
-Fleet mode: set PORTBOOK_SERVER=http://<host>:7800 and reserve/release/list/check/gc coordinate
-against that shared server; PORTBOOK_MACHINE overrides this machine's name. See docs/FLEET.md.
+Fleet mode: set PORTBOOK_SERVER=http://<host>:7800 and every ledger command (reserve, release, list,
+check, gc, block/blocks, request/inbox/requests/grant/deny) coordinates against that shared server;
+PORTBOOK_MACHINE overrides this machine's name. See docs/FLEET.md.
 
 Examples:
   portbook reserve --project webapp --port 4100 --purpose "api origin" --owner claude
   PORT=$(portbook reserve --project api --count 1 --range 4200-4299)
   portbook block --project api --range 4200-4299            # claim a range; api's auto-picks land here
   portbook adopt 5432 --project postgres                    # register a service already on this port
+  portbook request --port 5173 --from webapp --reason "vite default"   # negotiate for a held port
   portbook env                                              # containers labeled by name/image
   portbook serve --open                                     # open the dashboard in your browser
   portbook scan --range 4000-9000`;
@@ -92,6 +100,43 @@ function fmtBlocks(rows) {
     (b) => `${pad(b.project, 16)} ${mval(b)}${pad(`${b.rangeStart}–${b.rangeEnd}`, 13)} ${pad((b.owner || "-").slice(0, 12), 12)} ${b.purpose || ""}`
   );
   return [head, ...lines].join("\n");
+}
+
+// Humanize how long ago an ISO timestamp was — the request tables show AGE, not raw dates.
+function age(iso) {
+  const s = Math.floor((Date.now() - Date.parse(iso)) / 1000);
+  if (!Number.isFinite(s)) return "?";
+  const v = Math.max(0, s);
+  return v < 60 ? `${v}s` : v < 3600 ? `${Math.floor(v / 60)}m` : v < 86400 ? `${Math.floor(v / 3600)}h` : `${Math.floor(v / 86400)}d`;
+}
+
+// Render the holder's inbox: pending asks against your reservations/blocks. A TO column appears only
+// when the asks target more than one project (same trick as fmt's MACHINE column).
+function fmtInbox(rows) {
+  if (!rows.length) return "(no pending requests)";
+  const pad = (s, n) => String(s ?? "").padEnd(n);
+  const multi = new Set(rows.map((q) => q.targetProject)).size > 1;
+  const tcol = multi ? `${pad("TO", 16)} ` : "";
+  const tval = (q) => (multi ? `${pad(q.targetProject, 16)} ` : "");
+  const head = `${pad("ID", 16)} ${pad("PORT", 6)} ${pad("FROM", 16)} ${tcol}${pad("REASON", 28)} AGE`;
+  const lines = rows.map(
+    (q) => `${pad(q.id, 16)} ${pad(q.port, 6)} ${pad(q.fromProject, 16)} ${tval(q)}${pad((q.reason || "-").slice(0, 28), 28)} ${age(q.createdAt)}`
+  );
+  return [head, ...lines, "", "• answer with `portbook grant <id>` or `portbook deny <id> [--note \"...\"]`"].join("\n");
+}
+
+// The requester's view: everything you filed, newest first, with the holder's verdict + note.
+function fmtOutbox(rows) {
+  if (!rows.length) return "(no requests filed)";
+  const pad = (s, n) => String(s ?? "").padEnd(n);
+  const status = (q) => (q.status === "granted" && q.consumed ? "granted (claimed)" : q.status);
+  const head = `${pad("ID", 16)} ${pad("PORT", 6)} ${pad("TO", 16)} ${pad("STATUS", 17)} ${pad("NOTE", 24)} AGE`;
+  const lines = rows.map(
+    (q) => `${pad(q.id, 16)} ${pad(q.port, 6)} ${pad(q.targetProject, 16)} ${pad(status(q), 17)} ${pad((q.note || "-").slice(0, 24), 24)} ${age(q.createdAt)}`
+  );
+  const ready = rows.filter((q) => q.status === "granted" && !q.consumed);
+  const notes = ready.map((q) => `• port ${q.port} is granted and held for you — claim it: \`portbook reserve --project ${q.fromProject} --port ${q.port}\``);
+  return [head, ...lines, ...(notes.length ? ["", ...notes] : [])].join("\n");
 }
 
 // Render `portbook fleet` — reservations grouped by machine + what each machine last reported.
@@ -192,10 +237,11 @@ async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   const a = parseArgs(argv.slice(1));
-  // Fleet mode: when $PORTBOOK_SERVER is set, ledger ops (reserve/release/list/check/gc) go to the
-  // shared server; scan/env/serve stay local (they describe THIS machine). See docs/FLEET.md.
+  // Fleet mode: when $PORTBOOK_SERVER is set, ledger ops (reserve/release/list/check/gc, blocks, and
+  // the request flow) go to the shared server; scan/env/serve stay local (they describe THIS machine).
+  // See docs/FLEET.md.
   const remote = process.env.PORTBOOK_SERVER ? await import("../src/client.js") : null;
-  const reg = remote || { reserve, release, list, check, gc, reserveBlock, releaseBlock, listBlocks };
+  const reg = remote || { reserve, release, list, check, gc, reserveBlock, releaseBlock, listBlocks, requestPort, inbox, outbox, resolveRequest };
   try {
     if (!cmd || cmd === "help" || a.help) { console.log(HELP); return; }
     if (cmd === "where") { console.log(remote ? process.env.PORTBOOK_SERVER : FILE); return; }
@@ -258,6 +304,45 @@ async function main() {
       }
       const n = await reg.release({ project: a.project, port: requireInt("--port", a.port), id: a.id });
       console.log(`released ${n} reservation(s)`);
+      return;
+    }
+    if (cmd === "request") {
+      // A port you need is HELD (a reservation, or inside another project's block): ask through the
+      // ledger instead of clobbering. --from is REQUIRED — a request needs an identity, or the holder
+      // has no idea whose ask they'd be granting.
+      const port = requireInt("--port", a.port) ?? num(a._[0]);
+      if (!port) throw new Error("request requires --port, e.g. `portbook request --port 5173 --from webapp --reason \"vite default\"`");
+      if (typeof a.from !== "string") throw new Error("request requires --from <project> — who is asking? The holder sees this in `portbook inbox`");
+      const req = await reg.requestPort({
+        port, fromProject: a.from,
+        fromOwner: typeof a.owner === "string" ? a.owner : null,
+        reason: typeof a.reason === "string" ? a.reason : null,
+      });
+      console.log(a.json ? JSON.stringify(req, null, 2)
+        : `request ${req.id} (${req.status}): port ${req.port} asked of "${req.targetProject}" — verdict shows in \`portbook requests --from ${req.fromProject}\``);
+      return;
+    }
+    if (cmd === "inbox") {
+      const rows = await reg.inbox({ project: a.project }); // await: local inbox() is sync, remote is async
+      console.log(a.json ? JSON.stringify(rows, null, 2) : fmtInbox(rows));
+      return;
+    }
+    if (cmd === "requests") {
+      if (typeof a.from !== "string") throw new Error("requests requires --from <project>, e.g. `portbook requests --from webapp`");
+      const rows = await reg.outbox({ fromProject: a.from });
+      console.log(a.json ? JSON.stringify(rows, null, 2) : fmtOutbox(rows));
+      return;
+    }
+    if (cmd === "grant" || cmd === "deny") {
+      const id = a._[0];
+      if (!id) throw new Error(`${cmd} requires a request id, e.g. \`portbook ${cmd} <id>\` — ids are in \`portbook inbox\``);
+      const res = await reg.resolveRequest({ id, action: cmd, note: typeof a.note === "string" ? a.note : null });
+      if (a.json) { console.log(JSON.stringify(res, null, 2)); return; }
+      console.log(cmd === "deny"
+        ? `denied request ${res.id} — "${res.fromProject}" stays off port ${res.port}${res.note ? ` (note: ${res.note})` : ""}`
+        : `granted request ${res.id}: port ${res.port} → "${res.fromProject}" — ` + (res.releasedReservation
+            ? `released "${res.targetProject}"'s reservation; the port is held for them until they reserve it`
+            : `issued a one-shot exemption through "${res.targetProject}"'s block (consumed when they reserve ${res.port})`));
       return;
     }
     if (cmd === "list") {

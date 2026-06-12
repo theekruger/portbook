@@ -83,6 +83,25 @@ shape your scripts parse. Your own project's block
 never blocks *you* — overlapping or reserving inside your own territory is always fine; that's the
 whole point of claiming it.
 
+### Negotiation (requests)
+When a port you want is already **held** — reserved by another project, or inside its block — don't
+kill the process or steal the claim: **ask through the ledger**.
+
+```bash
+portbook request --port 5173 --from webapp --reason "vite default"   # file the ask
+portbook inbox --project api                 # the HOLDER: pending asks against your ports
+portbook grant <id> --note "all yours"       # …or: portbook deny <id> --note "still using it"
+portbook requests --from webapp              # the REQUESTER: poll your filings for the verdict
+```
+
+A **grant** releases the holder's reservation in the same locked write and holds the port for the
+requester until they `reserve` it; if the port was only block-territory, the grant is a one-shot
+exemption through that block instead (the territory survives). A **deny** leaves the verdict + note
+in the requester's outbox. Resolved requests age out after ~a day, unanswered ones after ~a week.
+The same verbs exist as MCP tools and HTTP routes ([docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)) —
+and they're the conflict-resolution half of the **cubicle pattern** for running many agents on one
+machine: **[docs/CUBICLES.md](docs/CUBICLES.md)**.
+
 ### Adopting an existing port
 Sometimes a port is already in use by something portbook didn't reserve — a database, a system
 daemon, a server you started by hand. Two commands handle that:
@@ -116,6 +135,8 @@ Tailscale IP (`--bind`) and the very same process becomes the shared registry fo
 
 ## For AI agents
 See **[AGENTS.md](./AGENTS.md)** — the one rule that makes this work: *never hardcode a port; reserve first, release on stop.* Drop that section into your project's `CLAUDE.md` / `AGENTS.md`.
+Running a whole fleet of agents in parallel on one machine (worktrees / containers / VMs)? The
+cubicle pattern — isolation walls plus a shared port ledger — is in **[docs/CUBICLES.md](docs/CUBICLES.md)**.
 
 ## Integrations
 Drive portbook from the tools you already use — all thin clients over the same zero-dependency core.
@@ -123,7 +144,8 @@ Full guide: **[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)**.
 
 - **AI agent harnesses** (Claude Code, Codex, Cursor, Windsurf, Hermes) — the **MCP server**: `portbook mcp`
   speaks JSON-RPC over stdio and exposes `reserve`/`release`/`list`/`check`/`scan`/`ecosystem`/`gc` —
-  plus the block-territory tools `reserve_block`/`list_blocks`/`release_block` — as tools.
+  plus the block-territory tools `reserve_block`/`list_blocks`/`release_block` and the negotiation
+  tools `request_port`/`inbox`/`my_requests`/`grant_request`/`deny_request` — as tools.
   Config + per-client setup in [integrations/mcp/](integrations/mcp/) (e.g. `claude mcp add portbook -- portbook mcp`).
 - **VS Code / Cursor / Windsurf** — a thin, buildless extension (status bar + live Ports view): [integrations/vscode/](integrations/vscode/).
 - **Zed** — task recipes that call the CLI: [integrations/zed/](integrations/zed/).
@@ -141,8 +163,9 @@ const eco = await ecosystem();              // host + containers + WSL, all cros
 ```
 
 ## Fleet mode (multiple machines)
-Set `PORTBOOK_SERVER=http://<host>:7800` and a machine's `reserve`/`release`/`list`/`check`/`gc`
-coordinate against that shared `portbook serve` authority instead of its local file — so every machine
+Set `PORTBOOK_SERVER=http://<host>:7800` and every ledger command — `reserve`/`release`/`list`/`check`/`gc`,
+`block`/`blocks`, and the `request`/`inbox`/`requests`/`grant`/`deny` flow — coordinates against
+that shared `portbook serve` authority instead of the local file — so every machine
 shares one registry. Conflicts are **per-machine** (two machines can both use `5000`). `portbook report`
 pushes a machine's ecosystem up; `portbook fleet` shows who's on what, everywhere; `portbook import`
 migrates a machine's existing local reservations into the shared server (skipping any already present),

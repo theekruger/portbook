@@ -5,6 +5,55 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-11
+
+Port **negotiation** — when a port you want is held, you ask through the ledger instead of
+clobbering — plus a core-wide hardening pass closing all **31 confirmed findings** from a full
+adversarial review. Still **zero runtime dependencies** (Node built-ins only, ESM, Node >= 18).
+
+### Added
+- **Port requests** (`requestPort`/`inbox`/`outbox`/`resolveRequest` in `src/registry.js`; a new
+  `requests[]` array in the registry) — the negotiation layer between agents: ask the holder of a
+  port instead of killing its process. CLI: `portbook request --port <p> --from <project>
+  [--owner <o>] [--reason "..."]` files the ask, `portbook inbox [--project <p>]` shows the asks
+  awaiting *your* answer, `portbook requests --from <project>` is the requester's outbox (verdicts +
+  notes), and `portbook grant <id>` / `portbook deny <id>` (each takes `--note "..."`) answer one. A **grant on a
+  reservation** releases the holder's claim in the same locked write and leaves the port **promised**
+  to the requester — auto-picks skip it and even the ex-holder is refused — until their `reserve`
+  consumes the grant; a **grant on a block** leaves the territory intact and issues a one-shot,
+  port-specific exemption through that block. Requests are conversation, not state: resolved rows
+  age out after ~24 h, unanswered ones after ~7 d, at most 32 pending per requester, and re-filing
+  an identical pending ask is idempotent.
+- **Negotiation on every surface**: HTTP (`GET /api/requests` with `?project=`/`?from=`/`?machine=`,
+  `POST /api/requests`, `POST /api/requests/resolve`), five MCP tools (`request_port`, `inbox`,
+  `my_requests`, `grant_request`, `deny_request`), and the fleet client — requests are
+  machine-scoped like everything else, so a cubicle/fleet client negotiates over the shared ledger.
+- **docs/CUBICLES.md** — the cubicle pattern: running many agents on one machine behind worktree /
+  container / VM walls, with the host port space those walls *concentrate* coordinated through one
+  shared `portbook serve`, territory blocks per agent, and request/grant instead of process-killing.
+
+### Hardened
+All 31 confirmed findings from the adversarial review of the core, across five fronts:
+- **Lock integrity** — stale-lock takeover is atomic (tombstone-rename; exactly one breaker wins),
+  release is owner-token-checked (a holder can never remove someone else's lock), and holders
+  heartbeat during slow work so a live-but-slow holder is never judged stale and stolen from.
+- **Ledger durability** — a corrupt registry is **quarantined** (`registry.json.corrupt-<ts>`) and
+  the operation aborts loudly instead of silently wiping everyone's reservations; only ENOENT reads
+  as a fresh registry; writes fsync before the atomic rename.
+- **Machine-scoped truth** — `scan`/`check`/`ecosystem` cross-reference only the local machine's
+  rows (a remote fleet hold can't masquerade as a local listener or a releasable ghost); legacy
+  machine-less rows collide correctly; `release`/`releaseBlock` selectors AND together instead of
+  widening; block claims are race-idempotent.
+- **Server security** — CSRF/origin gate on POSTs (cross-origin browser writes are 403),
+  constant-time token comparison, a bounded + TTL'd fleet-reports map, and oversized request bodies
+  settle with `413` instead of hanging the handler.
+- **CLI & parsers** — strict `--ttl`/`--pid`/`--port`/`--count`/`--range` validation (garbage exits 1
+  instead of silently becoming a permanent hold), locale-tolerant `netstat`/`lsof`/WSL parsing,
+  OS-excluded/privileged ports distinguished from in-use, and fleet multi-port reserve rolls back
+  partial commits on failure.
+
+[0.5.0]: https://github.com/theekruger/portbook/releases/tag/v0.5.0
+
 ## [0.4.0] - 2026-06-08
 
 Port **territory** — projects can now claim a whole range, not just one port at a time — plus

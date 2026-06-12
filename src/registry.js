@@ -81,7 +81,7 @@ export function readRegistry() {
   let raw;
   try { raw = fs.readFileSync(FILE, "utf8"); }
   catch (e) {
-    if (e.code === "ENOENT") return { version: 1, reservations: [], blocks: [] }; // no registry yet
+    if (e.code === "ENOENT") return { version: 1, reservations: [], blocks: [], requests: [] }; // no registry yet
     // EBUSY/EPERM/EACCES (AV / backup / sync tools) etc. — surface it. Returning "empty" here would
     // make the caller's next writeRegistry silently wipe the whole ledger.
     throw new Error(`cannot read registry ${FILE}: ${e.message}`);
@@ -91,6 +91,7 @@ export function readRegistry() {
     if (!j || typeof j !== "object" || Array.isArray(j)) throw new Error("not a registry object");
     if (!Array.isArray(j.reservations)) j.reservations = [];
     if (!Array.isArray(j.blocks)) j.blocks = [];
+    if (!Array.isArray(j.requests)) j.requests = [];
     return j;
   } catch (e) {
     // Corrupt ledger: QUARANTINE the evidence and abort loudly — never read "empty" and let a
@@ -130,9 +131,17 @@ const DENIED = new Set(["EACCES", "EACCESS", "EPERM"]); // bind forbidden by the
 // interfaces (strictest — flags anything bound anywhere).
 export async function isPortFree(port, host) { return (await probePort(port, host)).free; }
 
+// Requests are negotiation messages, not holds: resolved ones evaporate after a day, unanswered ones
+// after a week, so inboxes never silt up. Read live (functions, like machineName) so tests can shrink
+// a window per call, as $PORTBOOK_LOCK_STALE_MS does for the lock. The two windows are SEPARATE env
+// hooks on purpose: tuning how fast verdicts evaporate must never silently prune a still-pending ask.
+const REQUEST_TTL_MS = () => Number(process.env.PORTBOOK_REQUEST_TTL_MS) || 24 * 60 * 60 * 1000;
+const REQUEST_PENDING_TTL_MS = () => Number(process.env.PORTBOOK_REQUEST_PENDING_TTL_MS) || 7 * 24 * 60 * 60 * 1000;
+
 // Drop reservations that are expired or whose owning PID is gone. Returns the removed entries.
 // PID liveness only means something on the machine that made the reservation, so we skip the PID
 // check for holds owned by a different machine (a future fleet/server will reconcile those).
+// Also prunes aged-out requests (see TTLs above). Blocks are territory — never touched here.
 export function reconcile(reg) {
   const t = Date.now();
   const me = machineName();
@@ -144,6 +153,13 @@ export function reconcile(reg) {
     (expired || dead ? removed : kept).push(r);
   }
   reg.reservations = kept;
+  // A resolved request ages from its resolution, a pending one from its filing; an unparseable
+  // timestamp keeps the row (mirroring the lenient expiresAt check above — NaN never prunes).
+  reg.requests = (reg.requests || []).filter((q) => {
+    const pending = q.status === "pending";
+    const ts = Date.parse(pending ? q.createdAt : q.resolvedAt || q.createdAt);
+    return !(ts && t - ts > (pending ? REQUEST_PENDING_TTL_MS() : REQUEST_TTL_MS()));
+  });
   return removed;
 }
 
@@ -174,8 +190,22 @@ export async function reserve(opts = {}) {
     const chosen = [];
     if (port != null) {
       if (taken.has(key(port))) throw new Error(`port ${port} is already reserved on ${machine} by "${taken.get(key(port)).project}"`);
+      // GRANTED, unconsumed requests on this port (see requestPort/resolveRequest). For the grantee
+      // they're the one-shot pass through the GRANTING project's block; for everyone else they're a
+      // PROMISE — resolveRequest guarantees the grant→reserve handover is ledger-snipe-free, so until
+      // the grantee consumes the grant (or reconcile ages it out) nobody else may claim the port.
+      const grants = (reg.requests || []).filter((q) => q.status === "granted" && !q.consumed &&
+        q.port === port && (q.targetMachine || me) === machine);
+      const mine = grants.filter((q) => q.fromProject === project);
+      if (!mine.length && grants.length) {
+        throw new Error(`port ${port} on ${machine} is granted to "${grants[0].fromProject}" (request ${grants[0].id}) — request it or pick another port`);
+      }
       const fb = foreignBlock(port);
-      if (fb) throw new Error(`port ${port} is inside "${fb.project}"'s reserved block ${fb.rangeStart}-${fb.rangeEnd}`);
+      // A pass opens only the wall of the project that GRANTED it: territory that changed hands after
+      // the grant stays shut — the new owner never consented to the old owner's promise.
+      if (fb && !mine.some((q) => q.targetProject === fb.project)) {
+        throw new Error(`port ${port} is inside "${fb.project}"'s reserved block ${fb.rangeStart}-${fb.rangeEnd}`);
+      }
       // `adopt` registers a port you ALREADY run on (skips the free check). Otherwise it must be free.
       if (probe && !opts.adopt) {
         touchLock(); // heartbeat — a slow probe must not make us look crashed
@@ -186,6 +216,10 @@ export async function reserve(opts = {}) {
             : `port ${port} is in use at the OS level. Use --adopt if this is your own running service.`);
         }
       }
+      // Burn the grantee's pass(es) only on SUCCESS, in the same locked write as the reservation —
+      // never replayable, and a throw above (port OS-busy) never reached writeRegistry, so the
+      // grant survives a retry.
+      for (const q of mine) q.consumed = true;
       chosen.push(port);
     } else {
       // Auto-pick. If the caller didn't ask for an explicit range and this project owns block(s) on
@@ -195,10 +229,15 @@ export async function reserve(opts = {}) {
             .sort((a, b) => a.rangeStart - b.rangeStart)
         : [];
       const spans = own.length ? own.map((b) => [b.rangeStart, b.rangeEnd]) : [[rangeStart, rangeEnd]];
+      // Ports mid-handover (granted to ANOTHER project, unconsumed) are off-limits to auto-pick too —
+      // an innocent auto-picker must not swallow a promised port before its grantee reserves it.
+      const promised = new Set((reg.requests || [])
+        .filter((q) => q.status === "granted" && !q.consumed && q.fromProject !== project && (q.targetMachine || me) === machine)
+        .map((q) => q.port));
       let denied = 0; // ports the OS refuses to let ANYONE bind (excluded ranges / privileged)
       outer: for (const [lo, hi] of spans) {
         for (let p = lo; p <= hi && chosen.length < count; p++) {
-          if (foreignBlock(p) || taken.has(key(p))) continue;
+          if (foreignBlock(p) || taken.has(key(p)) || promised.has(p)) continue;
           if (!probe) { chosen.push(p); continue; }
           touchLock(); // heartbeat: probing a big range is slow — prove we're alive, not crashed
           const pr = await probePort(p, host);
@@ -306,6 +345,101 @@ export function listBlocks(opts = {}) {
 // The block on `machine` (a missing block-machine matches) whose range spans `port`, else null.
 export function blockAt(blocks, port, machine) {
   return blocks.find((b) => (b.machine || machine) === machine && b.rangeStart <= port && port <= b.rangeEnd) || null;
+}
+
+// ── Port REQUESTS: when a port you want is HELD, you ask through the ledger instead of clobbering.
+// A request targets whatever holds the port (a reservation, else a block spanning it); the holder
+// answers via resolveRequest. Grant on a reservation hands the port over immediately; grant on a
+// block leaves the territory intact but issues a one-shot exemption reserve() honors (see above).
+// Requests age out in reconcile() — they're conversation, not state worth keeping forever.
+export async function requestPort(opts = {}) {
+  const { port, fromProject, fromOwner = null, reason = null, machine = machineName() } = opts;
+  if (!fromProject) throw new Error("request requires a --project (who is asking)");
+  if (!validPort(port)) throw new Error(`invalid port ${port} — must be an integer 1-65535`);
+  return withLock(async () => {
+    const reg = readRegistry();
+    reconcile(reg); // a dead/expired hold isn't worth asking about — prune first, like reserve()
+    const me = machineName();
+    // Who holds the port on that machine? Machine-less rows/blocks are the registry HOST's — the
+    // same normalization reserve() applies. A reservation outranks a block (it's the finer claim).
+    const holder =
+      reg.reservations.find((r) => (r.machine || me) === machine && r.port === port) ||
+      reg.blocks.find((b) => (b.machine || me) === machine && b.rangeStart <= port && port <= b.rangeEnd);
+    if (!holder) throw new Error(`nothing holds port ${port} on ${machine} — just reserve it`);
+    if (holder.project === fromProject) throw new Error(`"${fromProject}" already holds port ${port} on ${machine} — no need to request it`);
+    // Idempotent: re-filing the identical still-pending ask returns the existing row (a retrying
+    // agent must not flood the holder's inbox). Matching the CURRENT holder too means a re-file after
+    // the port changed hands files anew at the right door, instead of forever returning a stale ask
+    // the new holder will never see (the old row ages out, or its target denies it).
+    // The write persists what reconcile pruned.
+    const dup = reg.requests.find((q) => q.status === "pending" && q.fromProject === fromProject &&
+      q.port === port && q.targetProject === holder.project && (q.targetMachine || me) === machine);
+    if (dup) { writeRegistry(reg); return dup; }
+    // Cap pending asks per requester — a runaway agent can't wallpaper every inbox on the machine.
+    const pending = reg.requests.filter((q) => q.status === "pending" && q.fromProject === fromProject);
+    if (pending.length >= 32) throw new Error(`"${fromProject}" already has ${pending.length} pending requests — resolve some (or let them age out) first`);
+    const req = {
+      id: uid(), port, targetProject: holder.project, targetMachine: machine,
+      fromProject, fromOwner, reason, status: "pending", note: null, consumed: false,
+      createdAt: nowISO(), resolvedAt: null,
+    };
+    reg.requests.push(req);
+    writeRegistry(reg);
+    return req;
+  });
+}
+
+// The asks awaiting `project`'s answer (every project's when omitted), scoped to one machine —
+// port 5000 on another box is someone else's conversation. Read-only, like list().
+export function inbox(opts = {}) {
+  const { project = null, machine = machineName() } = opts;
+  const reg = readRegistry();
+  const me = machineName();
+  return reg.requests.filter((q) =>
+    q.status === "pending" && (!project || q.targetProject === project) && ((q.targetMachine || me) === machine));
+}
+
+// The requester's view: everything `fromProject` has filed, all statuses, newest first. Read-only.
+export function outbox(opts = {}) {
+  const { fromProject } = opts;
+  if (!fromProject) throw new Error("outbox requires a --project (whose filings to show)");
+  const reg = readRegistry();
+  return reg.requests.filter((q) => q.fromProject === fromProject)
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+}
+
+// The holder answers a pending request. DENY just marks it (the requester reads the verdict in
+// outbox). GRANT releases the holder's reservation on that port in the SAME locked write, and until
+// the requester reserves (consuming the grant) reserve() holds the port for them — no window for a
+// third party to snipe it from the ledger (only an unmanaged OS bind could race them). If the holder
+// was a BLOCK there's no reservation to release; the granted row itself becomes the one-shot
+// exemption through the block that reserve() consumes.
+export async function resolveRequest(opts = {}) {
+  const { id, action, note = null } = opts;
+  if (!id) throw new Error("resolve requires a request --id");
+  if (action !== "grant" && action !== "deny") throw new Error(`invalid action "${action}" — must be "grant" or "deny"`);
+  return withLock(async () => {
+    const reg = readRegistry();
+    reconcile(reg);
+    const req = reg.requests.find((q) => q.id === id);
+    if (!req) throw new Error(`no request with id ${id} (it may have aged out)`);
+    if (req.status !== "pending") throw new Error(`request ${id} is already ${req.status}`);
+    req.status = action === "grant" ? "granted" : "denied";
+    req.resolvedAt = nowISO();
+    req.note = note;
+    let releasedReservation = false;
+    if (action === "grant") {
+      // AND-scoped exactly like release(): port + holder project + machine — never another
+      // project's hold on the same number, never the same project's hold on another machine.
+      const me = machineName();
+      const before = reg.reservations.length;
+      reg.reservations = reg.reservations.filter((r) =>
+        !(r.port === req.port && r.project === req.targetProject && (r.machine || me) === (req.targetMachine || me)));
+      releasedReservation = reg.reservations.length < before;
+    }
+    writeRegistry(reg);
+    return { ...req, releasedReservation };
+  });
 }
 
 export async function gc() {
