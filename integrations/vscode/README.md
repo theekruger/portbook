@@ -47,8 +47,15 @@ Command Palette, or:
 code --install-extension portbook.portbook
 ```
 
-(Cursor and Windsurf users: install from the bundled `.vsix` below or via Open VSX when available —
-their extension views use a different registry.)
+**Cursor / Windsurf / VSCodium / Gitpod / Theia** pull from the [Open VSX Registry](https://open-vsx.org/extension/portbook/portbook),
+where it's published as the same `portbook.portbook`: search **"portbook"** in the Extensions view, or:
+
+```bash
+# VSCodium and other ovsx-aware CLIs:
+codium --install-extension portbook.portbook
+# or fetch the .vsix from Open VSX and install it:
+npx ovsx get portbook.portbook   # downloads the .vsix; then "Install from VSIX…"
+```
 
 ### Run from source (no build step)
 
