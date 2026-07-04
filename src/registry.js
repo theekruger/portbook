@@ -81,7 +81,7 @@ export function readRegistry() {
   let raw;
   try { raw = fs.readFileSync(FILE, "utf8"); }
   catch (e) {
-    if (e.code === "ENOENT") return { version: 1, reservations: [], blocks: [], requests: [] }; // no registry yet
+    if (e.code === "ENOENT") return { version: 1, reservations: [], blocks: [], requests: [], origins: [] }; // no registry yet
     // EBUSY/EPERM/EACCES (AV / backup / sync tools) etc. — surface it. Returning "empty" here would
     // make the caller's next writeRegistry silently wipe the whole ledger.
     throw new Error(`cannot read registry ${FILE}: ${e.message}`);
@@ -92,6 +92,10 @@ export function readRegistry() {
     if (!Array.isArray(j.reservations)) j.reservations = [];
     if (!Array.isArray(j.blocks)) j.blocks = [];
     if (!Array.isArray(j.requests)) j.requests = [];
+    // origins[] (tailnet staging origins) is a v0.6.0 addition — a registry written by an older
+    // portbook simply lacks the field; normalize it so every reader/writer round-trips it gracefully
+    // (additive migration: nothing else in the on-disk shape changes).
+    if (!Array.isArray(j.origins)) j.origins = [];
     return j;
   } catch (e) {
     // Corrupt ledger: QUARANTINE the evidence and abort loudly — never read "empty" and let a
@@ -276,6 +280,13 @@ export async function release(opts = {}) {
     const before = reg.reservations.length;
     reg.reservations = reg.reservations.filter(
       (r) => !((!id || r.id === id) && (port == null || r.port === port) && (!project || r.project === project) && (!!id || onMachine(r)))
+    );
+    // Drop any tailnet staging origins anchored to the released {project, local port} in the SAME
+    // locked write — no orphans. An origin keys on its LOCAL port (the thing being released), and is
+    // matched by the same ANDed selectors (id matches the origin's OWN id; machine scopes it). The
+    // bin/teardown layer reads originsFor() first to run `tailscale serve … off` for each before this.
+    reg.origins = (reg.origins || []).filter(
+      (o) => !((!id || o.id === id) && (port == null || o.localPort === port) && (!project || o.project === project) && (!!id || !machine || (o.machine || machine) === machine))
     );
     writeRegistry(reg);
     return before - reg.reservations.length;
@@ -621,4 +632,84 @@ export async function scan() {
   }
   const ghosts = mine.filter((r) => !seen.has(r.port));
   return { machine: me, listeners, managed, unmanaged, ghosts };
+}
+
+// ── Tailnet staging ORIGINS: a public `https://<magicdns-host>:<tsPort>` proxy fronting a local port,
+// recorded against {project, localPort} so the one-origin-per-app mapping can't drift untracked. The
+// tailscale serve side is driven by src/tailscale.js + bin; this is the pure ledger half (storage,
+// idempotency, lookup, removal). Origins carry no PID/TTL — they're long-lived like blocks, never
+// reconciled or gc'd. Conflicts are PER MACHINE, mirroring reservations/blocks (a machine-less origin
+// is this machine's, the same normalization used elsewhere).
+
+// Record (or idempotently refresh) a staging origin. Keyed on {machine, project, localPort}: re-exposing
+// the same project's same local port UPDATES the existing row (new tsPort/url/host) instead of stacking
+// duplicates — so `expose` is idempotent and re-running after a hostname/tsPort change self-heals.
+// Throws if another PROJECT on this machine already serves the same tsPort (the dual-claim the whole
+// feature exists to prevent).
+export async function addOrigin(opts = {}) {
+  const { project, localPort, tsPort, url, host = null, owner = null, purpose = null, machine = machineName() } = opts;
+  if (!project) throw new Error("addOrigin requires a project");
+  if (!validPort(localPort)) throw new Error(`invalid local port ${localPort} — must be an integer 1-65535`);
+  if (!validPort(tsPort)) throw new Error(`invalid tailscale port ${tsPort} — must be an integer 1-65535`);
+  if (!url) throw new Error("addOrigin requires a url");
+  return withLock(async () => {
+    const reg = readRegistry();
+    const here = (m) => (m || machine) === machine; // machine-less origin == this machine
+    // A given tsPort fronts exactly ONE origin per machine. If ANOTHER project already serves it, that's
+    // the collision class — refuse loudly rather than silently retarget someone else's public URL.
+    const clash = reg.origins.find((o) => here(o.machine) && o.tsPort === tsPort && o.project !== project);
+    if (clash) throw new Error(`tailscale port ${tsPort} already fronts "${clash.project}" (${clash.url}) on ${machine} — pick another --https port`);
+    const existing = reg.origins.find((o) => here(o.machine) && o.project === project && o.localPort === localPort);
+    let origin;
+    if (existing) {
+      // Idempotent refresh: same {project, localPort} → update in place, preserving id/createdAt.
+      Object.assign(existing, { tsPort, url, host, machine, owner: owner ?? existing.owner, purpose: purpose ?? existing.purpose, updatedAt: nowISO() });
+      origin = existing;
+    } else {
+      origin = { id: uid(), project, localPort, tsPort, url, host, owner, purpose, machine, createdAt: nowISO(), updatedAt: nowISO() };
+      reg.origins.push(origin);
+    }
+    writeRegistry(reg);
+    return origin;
+  });
+}
+
+// Read-only: the staging origins matching the given selectors (ANDed exactly like release/originsFor's
+// teardown). Used by bin BEFORE release() to learn which tsPorts need `tailscale serve … off`, and to
+// confirm an origin exists. Omitting all selectors returns this machine's origins.
+export function originsFor(opts = {}) {
+  const { project, port, id, machine } = opts;
+  const me = machineName();
+  return readRegistry().origins.filter((o) =>
+    (!id || o.id === id) &&
+    (port == null || o.localPort === port) &&
+    (!project || o.project === project) &&
+    (!!id || (machine ? (o.machine || machine) === machine : (o.machine || me) === me)));
+}
+
+// Every recorded staging origin (this machine's; ?project= filters), sorted by local port. Read-only,
+// like list()/listBlocks(). On a fleet host the ledger may hold other machines' origins — they're not
+// this node's to manage, so a local listing scopes to this machine.
+export function listOrigins(opts = {}) {
+  const me = machineName();
+  let rows = readRegistry().origins.filter((o) => (o.machine || me) === me).slice().sort((a, b) => a.localPort - b.localPort);
+  if (opts.project) rows = rows.filter((o) => o.project === opts.project);
+  return rows;
+}
+
+// Drop origin record(s) by the same ANDed selectors release() uses (without touching reservations) —
+// the ledger half of teardown when the caller wants to remove an origin but keep the local port held.
+// Returns the count removed.
+export async function removeOrigin(opts = {}) {
+  const { project, port, id, machine } = opts;
+  if (port == null && !project && !id) throw new Error("removeOrigin requires a port, project, or id");
+  return withLock(async () => {
+    const reg = readRegistry();
+    const before = reg.origins.length;
+    reg.origins = reg.origins.filter(
+      (o) => !((!id || o.id === id) && (port == null || o.localPort === port) && (!project || o.project === project) && (!!id || !machine || (o.machine || machine) === machine))
+    );
+    writeRegistry(reg);
+    return before - reg.origins.length;
+  });
 }

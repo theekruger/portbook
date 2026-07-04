@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { reserve, release, list, check, gc, scan, annotate, machineName, FILE, reserveBlock, releaseBlock, listBlocks, blockAt, requestPort, inbox, outbox, resolveRequest } from "../src/registry.js";
+import { reserve, release, list, check, gc, scan, annotate, machineName, FILE, reserveBlock, releaseBlock, listBlocks, blockAt, requestPort, inbox, outbox, resolveRequest, addOrigin, listOrigins, originsFor } from "../src/registry.js";
 import { ecosystem } from "../src/environments.js";
+import * as tailscale from "../src/tailscale.js";
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -33,6 +34,9 @@ Usage:
   portbook release (--project <name> | --port <p> | --id <id>)
   portbook release (--block <id> | --project <name> --blocks)  # release reserved port block(s)
   portbook adopt <port> [--project <p>] [--owner <o>] [--purpose "..."]  # claim a running OS/external port
+  portbook expose --project <p> --port <local> [--https <tsPort>] [--owner <o>] [--purpose "..."] [--json]
+                                                            # reserve <local> + tailscale-serve it as a tailnet HTTPS origin
+  portbook origins [--project <p>] [--json]                # recorded tailnet staging origins (project · local · URL · bound?)
   portbook block --project <name> --range <a-b> [--owner <o>] [--purpose "..."]  # claim a port territory
   portbook block --project <name> | portbook blocks [--json]   # list reserved port blocks
   portbook request --port <p> --from <project> [--owner <o>] [--reason "..."] [--json]
@@ -43,6 +47,7 @@ Usage:
   portbook deny <id> [--note "..."] [--json]                # refuse it (your note lands in their outbox)
   portbook list [--project <name>] [--json] [--no-probe]    # reserved ports + live OS state
   portbook scan [--range <a-b>] [--json]                    # what's ACTUALLY listening on this machine
+  portbook doctor [--json]                                  # warn about UNMANAGED / collided tailscale-serve origins
   portbook env [--json]                                     # full ecosystem: host + containers + WSL
   portbook serve [--port 7800] [--bind 127.0.0.1] [--open]  # live web dashboard (zero-dependency)
   portbook mcp                                              # MCP stdio server (JSON-RPC) for AI agent harnesses
@@ -62,6 +67,8 @@ Examples:
   PORT=$(portbook reserve --project api --count 1 --range 4200-4299)
   portbook block --project api --range 4200-4299            # claim a range; api's auto-picks land here
   portbook adopt 5432 --project postgres                    # register a service already on this port
+  portbook expose --project jobgetter --port 5180           # reserve 5180 + serve it at https://<host>:<auto>
+  portbook origins                                          # every tracked tailnet staging origin
   portbook request --port 5173 --from webapp --reason "vite default"   # negotiate for a held port
   portbook env                                              # containers labeled by name/image
   portbook serve --open                                     # open the dashboard in your browser
@@ -186,6 +193,47 @@ function fmtScan(res, inRange, blocks = []) {
   return lines.join("\n");
 }
 
+// Render the staging-origins table: LOCAL port · tailscale port · public URL · whether tailscale is
+// actually serving it (correlated with live `tailscale serve status`). `serving` is null when we
+// couldn't reach tailscale (shows "?") so the registry view still prints.
+function fmtOrigins(rows) {
+  if (!rows.length) return "(no staging origins — `portbook expose --project <p> --port <local>` to add one)";
+  const pad = (s, n) => String(s ?? "").padEnd(n);
+  const liveOf = (o) => (o.serving == null ? "?" : o.serving ? "yes" : "no");
+  const head = `${pad("PROJECT", 16)} ${pad("LOCAL", 6)} ${pad("TS", 6)} ${pad("BOUND", 6)} URL`;
+  const lines = rows.map((o) => `${pad(o.project, 16)} ${pad(o.localPort, 6)} ${pad(o.tsPort, 6)} ${pad(liveOf(o), 6)} ${o.url}`);
+  const drifted = rows.filter((o) => o.serving === false).length;
+  const notes = drifted ? ["", `• ${drifted} origin(s) recorded but NOT live in tailscale serve — re-run \`portbook expose\` or \`portbook release\``] : [];
+  return [head, ...lines, ...notes].join("\n");
+}
+
+// Render `portbook doctor`: the tailscale-origin health report. Loud about the two failure classes —
+// serve mappings tailscale runs that portbook doesn't track (UNMANAGED), and origins/local ports that
+// are dual-claimed or whose local port belongs to a different project (the collision class).
+function fmtDoctor(d) {
+  const pad = (s, n) => String(s ?? "").padEnd(n);
+  const L = [`machine: ${d.machine}`];
+  if (!d.tailscale) {
+    L.push("", "tailscale: UNAVAILABLE — " + (d.tailscaleError || "could not query `tailscale`") + " (origin checks skipped)");
+    return L.join("\n");
+  }
+  L.push(`tailscale: ${d.serving.length} serve mapping(s), ${d.origins.length} tracked origin(s)`, "");
+  if (!d.unmanaged.length && !d.problems.length) {
+    L.push("OK — every tailscale serve origin is tracked in portbook, no collisions.");
+    return L.join("\n");
+  }
+  if (d.unmanaged.length) {
+    L.push(`UNMANAGED (${d.unmanaged.length}) — tailscale is serving these, but portbook isn't tracking them:`);
+    for (const m of d.unmanaged) L.push(`  ${pad(m.url, 44)} → http://127.0.0.1:${m.localPort ?? "?"}   (adopt: \`portbook expose --project <p> --port ${m.localPort ?? "<local>"} --https ${m.tsPort}\`)`);
+    L.push("");
+  }
+  if (d.problems.length) {
+    L.push(`COLLISIONS (${d.problems.length}) — surfaced loudly:`);
+    for (const p of d.problems) L.push(`  ! ${p}`);
+  }
+  return L.join("\n").replace(/\n$/, "");
+}
+
 // Strict `--range a-b`: both bounds must be positive integers (e.g. 4200-4299) — anything else exits 1.
 function parseRange(v) {
   if (v === undefined) return [undefined, undefined];
@@ -276,6 +324,75 @@ async function main() {
       console.log(a.json ? JSON.stringify(made, null, 2) : made.map((m) => m.port).join("\n"));
       return;
     }
+    if (cmd === "expose") {
+      // One dedicated tailscale HTTPS port per app-origin, tracked in portbook. Steps, all idempotent:
+      //  1. reserve the LOCAL port for the project (skip if this project already holds it),
+      //  2. `tailscale serve --bg --https=<tsPort> http://127.0.0.1:<local>` (auto-pick a free tsPort,
+      //     avoiding live serve ports AND portbook-recorded ones, when --https is omitted),
+      //  3. record the public origin https://<magicdns-host>:<tsPort> against {project, local} and print it.
+      // The reservation routes through fleet mode if active; the serve mapping + origin record are
+      // inherently LOCAL to this tailscale node, so they always live in the local registry.
+      if (!a.project || typeof a.project !== "string") throw new Error("expose requires --project <name>");
+      const local = requireInt("--port", a.port);
+      if (!local) throw new Error("expose requires --port <local>, e.g. `portbook expose --project app --port 5180`");
+      const owner = typeof a.owner === "string" ? a.owner : null;
+      const purpose = typeof a.purpose === "string" ? a.purpose : null;
+      // (0) tailscale must be reachable BEFORE we reserve, so a failure leaves no half-done state.
+      const host = await tailscale.magicDnsName();
+      const serving = await tailscale.servePorts();
+      // (1) reserve the local port — unless THIS project already holds it (idempotent re-expose). A
+      // check() telling us another project owns it surfaces as a loud reserve() conflict below.
+      const existing = (await reg.list({ project: a.project })).find((r) => r.port === local);
+      if (!existing) {
+        await reg.reserve({ project: a.project, port: local, owner, purpose: purpose || `tailnet origin (:${local})`, adopt: true });
+      }
+      // (2) pick the tailscale HTTPS port. Precedence:
+      //   • explicit --https wins (refused if it's serving for someone ELSE — the dual-claim guard);
+      //   • else REUSE the tsPort already recorded for THIS {project, local} so re-expose is truly
+      //     idempotent (no fresh port, no orphaned old mapping);
+      //   • else auto-pick the lowest free tsPort, avoiding live serve ports AND every tsPort portbook
+      //     already records across all projects on this machine.
+      const tracked = listOrigins().find((o) => o.project === a.project && o.localPort === local);
+      const reservedTs = new Set(listOrigins().map((o) => o.tsPort));
+      const askedTs = requireInt("--https", a.https);
+      let tsPort, prevTs = null;
+      if (askedTs) {
+        if (serving.has(askedTs) && !listOrigins().some((o) => o.tsPort === askedTs && o.project === a.project)) {
+          // Already serving for someone else (or untracked) — refuse rather than retarget it.
+          throw new Error(`tailscale port ${askedTs} is already serving — pick another --https port or run \`portbook doctor\``);
+        }
+        tsPort = askedTs;
+        if (tracked && tracked.tsPort !== askedTs) prevTs = tracked.tsPort; // moving an origin to a new port
+      } else if (tracked) {
+        tsPort = tracked.tsPort; // idempotent re-expose: keep the same public origin
+      } else {
+        tsPort = tailscale.pickTsPort(serving, reservedTs);
+      }
+      // (3) run the serve (idempotent on tailscale's side) and record the origin. If an explicit
+      // --https moved the origin off its old port, tear the stale serve mapping down first (no orphan).
+      if (prevTs != null) { try { await tailscale.serveOff(prevTs); } catch { /* best-effort */ } }
+      await tailscale.serveOn(tsPort, local);
+      const url = `https://${host}:${tsPort}`;
+      const origin = await addOrigin({ project: a.project, localPort: local, tsPort, url, host, owner, purpose });
+      if (a.json) { console.log(JSON.stringify(origin, null, 2)); return; }
+      console.log(url);
+      return;
+    }
+    if (cmd === "origins") {
+      const rows = listOrigins({ project: a.project });
+      // Correlate with live `tailscale serve status` so the BOUND column reflects reality; if tailscale
+      // is unavailable, fall back to the registry view (serving:null → "?") rather than failing.
+      let live = null;
+      try { live = await tailscale.serveStatus(); }
+      catch { /* tailscale unavailable — registry-only view */ }
+      const serveByPort = live ? new Map(live.map((m) => [m.tsPort, m])) : null;
+      const annotated = rows.map((o) => ({
+        ...o,
+        serving: serveByPort ? (serveByPort.has(o.tsPort) && serveByPort.get(o.tsPort).localPort === o.localPort) : null,
+      }));
+      console.log(a.json ? JSON.stringify(annotated, null, 2) : fmtOrigins(annotated));
+      return;
+    }
     if (cmd === "block") {
       if (a.range) {
         const [rangeStart, rangeEnd] = parseRange(a.range);
@@ -302,8 +419,24 @@ async function main() {
         console.log(`released ${n} block(s)`);
         return;
       }
-      const n = await reg.release({ project: a.project, port: requireInt("--port", a.port), id: a.id });
-      console.log(`released ${n} reservation(s)`);
+      const port = requireInt("--port", a.port);
+      // Tear down any tailscale staging origin(s) anchored to what's being released — `tailscale serve
+      // --https=<tsPort> off` for each — BEFORE dropping the records, so we never orphan a live serve
+      // mapping. Origins are local to this node, so we read them from the LOCAL registry (originsFor)
+      // regardless of fleet mode; reg.release() then drops both the reservation and the origin record.
+      const doomed = originsFor({ project: a.project, port, id: a.id });
+      let tornDown = 0;
+      for (const o of doomed) {
+        try { await tailscale.serveOff(o.tsPort); tornDown++; }
+        catch (e) {
+          // tailscale gone/unreachable: don't block the release — warn, drop the record anyway (the
+          // record is the orphan risk; a dangling serve mapping is visible in `portbook doctor`).
+          console.error(`portbook: warning — could not run \`tailscale serve --https=${o.tsPort} off\` for ${o.url} (${e?.message || e}); dropping the record anyway`);
+        }
+      }
+      const n = await reg.release({ project: a.project, port, id: a.id });
+      const originNote = doomed.length ? ` and ${doomed.length} staging origin(s)${tornDown < doomed.length ? ` (${tornDown} torn down in tailscale)` : ""}` : "";
+      console.log(`released ${n} reservation(s)${originNote}`);
       return;
     }
     if (cmd === "request") {
@@ -364,6 +497,50 @@ async function main() {
       if (a.json) { console.log(JSON.stringify(res, null, 2)); return; }
       const blocks = await reg.listBlocks({}); // annotate each port with its owning block (this machine)
       console.log(fmtScan(res, (p) => lo == null || (p >= lo && p <= hi), blocks));
+      return;
+    }
+    if (cmd === "doctor") {
+      // Reconcile live `tailscale serve status` against the portbook ledger and surface, loudly, the
+      // two failure classes the one-origin-per-app rule exists to catch:
+      //   • UNMANAGED — tailscale serves an origin portbook isn't tracking (it can drift / collide
+      //     silently with a tracked one).
+      //   • COLLISIONS — a tsPort dual-claimed by two origins; a tracked origin's serve target that has
+      //     drifted from what tailscale actually serves; or a local port fronted by a tailscale origin
+      //     but owned by a DIFFERENT project in portbook (or not reserved at all).
+      const me = machineName();
+      const origins = listOrigins();
+      const reservations = await annotate(await reg.list({})); // for the "local port owned by X" cross-check
+      const resByPort = new Map(reservations.filter((r) => !r.machine || r.machine === me).map((r) => [r.port, r]));
+      let serving = null, tailscaleError = null;
+      try { serving = await tailscale.serveStatus(); }
+      catch (e) { tailscaleError = e?.message || String(e); }
+      const report = { machine: me, tailscale: serving != null, tailscaleError, serving: serving || [], origins, unmanaged: [], problems: [] };
+      if (serving) {
+        const trackedByTs = new Map(origins.map((o) => [o.tsPort, o]));
+        // (a) serve mappings with no matching tracked origin → UNMANAGED.
+        for (const m of serving) if (!trackedByTs.has(m.tsPort)) report.unmanaged.push(m);
+        // (b1) tracked origins whose live serve target drifted (or vanished).
+        for (const o of origins) {
+          const m = serving.find((s) => s.tsPort === o.tsPort);
+          if (!m) report.problems.push(`origin ${o.url} (project "${o.project}") is recorded but tailscale is NOT serving tsPort ${o.tsPort} — re-run \`portbook expose\` or \`portbook release\``);
+          else if (m.localPort != null && m.localPort !== o.localPort) report.problems.push(`origin ${o.url} should proxy :${o.localPort} (project "${o.project}") but tailscale serves :${m.localPort} — drift; re-run \`portbook expose\``);
+        }
+      }
+      // (b2) ledger-only collision class (independent of tailscale liveness): a local port fronted by a
+      // tracked origin but reserved by a DIFFERENT project, or not reserved at all; and any tsPort that
+      // two tracked origins both claim.
+      const seenTs = new Map();
+      for (const o of origins) {
+        const dup = seenTs.get(o.tsPort);
+        if (dup && dup.project !== o.project) report.problems.push(`tailscale port ${o.tsPort} is dual-claimed by "${dup.project}" (${dup.url}) and "${o.project}" (${o.url}) — release one`);
+        seenTs.set(o.tsPort, o);
+        const r = resByPort.get(o.localPort);
+        if (!r) report.problems.push(`origin ${o.url} fronts local :${o.localPort} but no portbook reservation holds it — \`portbook reserve --project ${o.project} --port ${o.localPort}\``);
+        else if (r.project !== o.project) report.problems.push(`origin ${o.url} (project "${o.project}") fronts local :${o.localPort}, but that port is RESERVED by "${r.project}" — collision`);
+      }
+      if (a.json) { console.log(JSON.stringify(report, null, 2)); return; }
+      console.log(fmtDoctor(report));
+      if (report.unmanaged.length || report.problems.length) process.exitCode = 1; // loud: nonzero so CI/scripts catch it
       return;
     }
     if (cmd === "env" || cmd === "ecosystem") {
