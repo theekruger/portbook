@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { reserve, release, gc, list, check, scan, annotate, machineName, reserveBlock, releaseBlock, listBlocks, requestPort, inbox, outbox, resolveRequest } from "./registry.js";
+import { reserve, release, renew, gc, list, check, scan, annotate, machineName, reserveBlock, releaseBlock, listBlocks, requestPort, inbox, outbox, resolveRequest } from "./registry.js";
 import { ecosystem } from "./environments.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -119,6 +119,9 @@ export function createServer() {
 
       if (req.method === "POST" && p === "/api/reserve") return send(res, 200, await reserve(await readBody(req)));
       if (req.method === "POST" && p === "/api/release") return send(res, 200, { released: await release(await readBody(req)) });
+      // Extend a TTL hold in place (no release+re-reserve snipe window). Body carries the same ANDed
+      // selectors as release plus ttlSec; fleet clients pass their machine. Returns the renewed rows.
+      if (req.method === "POST" && p === "/api/renew") return send(res, 200, await renew(await readBody(req)));
       if (req.method === "POST" && p === "/api/blocks") return send(res, 200, await reserveBlock(await readBody(req)));
       if (req.method === "POST" && p === "/api/blocks/release") return send(res, 200, { released: await releaseBlock(await readBody(req)) });
       // Requests: file an ask / answer one. The body carries `machine` from fleet clients (which

@@ -8,7 +8,7 @@
 // Zero dependencies: just the registry/environment functions and node streams.
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { reserve, release, list, check, gc, scan, annotate, reserveBlock, releaseBlock, listBlocks, requestPort, inbox, outbox, resolveRequest } from "./registry.js";
+import { reserve, release, renew, list, check, gc, scan, annotate, reserveBlock, releaseBlock, listBlocks, requestPort, inbox, outbox, resolveRequest, readEvents } from "./registry.js";
 import { ecosystem } from "./environments.js";
 
 // serverInfo reports the REAL package version, read once at load — a hardcoded literal here sat at
@@ -93,9 +93,38 @@ const TOOLS = [
   },
   {
     name: "gc",
-    description: "Reclaim stale reservations (dead owning PID or expired TTL). Returns the removed entries.",
+    description: "Reclaim stale reservations (dead owning PID or expired TTL — including a PID that was reused by an unrelated process). Returns the removed entries.",
     inputSchema: { type: "object", properties: {} },
     run: () => gc(),
+  },
+  {
+    name: "renew",
+    description: "Extend a TTL reservation's lifetime in place (no release+re-reserve race). Only holds that already carry a TTL are touched. Returns the renewed rows.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Renew every TTL hold for this project." },
+        port: { ...port, description: "Renew the TTL hold on this port." },
+        id: { type: "string", description: "Renew the single hold with this id." },
+        ttlSec: { type: "integer", minimum: 1, description: "New lifetime in seconds, from now (required)." },
+      },
+      required: ["ttlSec"],
+    },
+    run: (a) => renew(a),
+  },
+  {
+    name: "log",
+    description: "The audit trail: who reserved/released/reclaimed which port, when, and why (reserve, release, gc with reason, block, request/grant/deny, expose). Use it to investigate a port that changed hands unexpectedly.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Only events for this project." },
+        port: { ...port, description: "Only events touching this port." },
+        op: { type: "string", description: "Only this operation (reserve, release, gc, renew, block, request, grant, deny, expose...)." },
+        limit: { type: "integer", minimum: 1, description: "Max events to return, newest kept (default 200)." },
+      },
+    },
+    run: (a) => readEvents(a),
   },
   // Port TERRITORY (AGENTS.md rule 3): blocks mirror reserveBlock/releaseBlock/listBlocks 1:1, same
   // as the CLI's `portbook block`/`blocks` and the HTTP /api/blocks endpoints.

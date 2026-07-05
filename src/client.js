@@ -8,6 +8,7 @@
 // server never probes a port it can't see. Zero dependencies — Node's global fetch.
 import { isPortFree, pidAlive, machineName } from "./registry.js";
 import { ecosystem } from "./environments.js";
+import { wslListenerPorts } from "./wsl.js";
 
 const base = () => {
   const s = (process.env.PORTBOOK_SERVER || "").replace(/\/+$/, "");
@@ -61,8 +62,13 @@ export async function reserve(opts = {}) {
   // mirroring the core auto-pick's `promised` skip, instead of aborting the whole batch.
   const isConflict = (e) => /already reserved on|is inside "[^"]*"'s reserved block|is granted to "/.test(e?.message || "");
 
+  // OS truth is the CLIENT's job in fleet mode — including the WSL2 shared-localhost check the core
+  // runs locally (a port serving inside one of OUR distros is taken on OUR machine; the server can't
+  // see it). One batch query; empty off-Windows / on failure / with $PORTBOOK_NO_WSL=1.
+  const wslBusy = adopt ? new Map() : await wslListenerPorts();
   if (port != null) {
     if (!adopt && !(await isPortFree(port, host))) throw new Error(`port ${port} is in use on ${machine} at the OS level. Use --adopt if it's your own service.`);
+    if (wslBusy.has(port)) throw new Error(`port ${port} is free on the Windows host but LISTENING inside WSL distro "${wslBusy.get(port)}" — WSL2 shares localhost, so binding it would collide/shadow that service. Pick another port, or --adopt if that service is this project's.`);
     return [await commit(port)]; // a ledger conflict on a SPECIFIC port surfaces as-is (can't retry it)
   }
 
@@ -90,7 +96,7 @@ export async function reserve(opts = {}) {
   const rollback = async () => { for (const m of made) await post("/api/release", { id: m.id }).catch(() => {}); };
   outer: for (const [lo, hi] of spans) {
     for (let p = lo; p <= hi && made.length < count; p++) {
-      if (foreignBlock(p) || taken.has(p) || !(await isPortFree(p, host))) continue;
+      if (foreignBlock(p) || taken.has(p) || wslBusy.has(p) || !(await isPortFree(p, host))) continue;
       try { made.push(await commit(p)); taken.add(p); }
       catch (e) { if (isConflict(e)) { taken.add(p); continue; } await rollback(); throw e; }
     }
@@ -109,6 +115,12 @@ export async function reserve(opts = {}) {
 export async function release(opts = {}) {
   const body = (await post("/api/release", { ...opts, machine: machineName() }));
   return body.released ?? 0;
+}
+
+// Extend a TTL hold's lifetime in the shared ledger, scoped to THIS machine (`id` is global).
+// Returns the renewed rows, mirroring the core's renew().
+export async function renew(opts = {}) {
+  return post("/api/renew", { ...opts, machine: machineName() });
 }
 
 // Raw reservations from the shared registry (all machines). bin/the caller annotates locally so live

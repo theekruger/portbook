@@ -23,6 +23,7 @@ npm link        # same thing, your checkout on PATH
 
 ## Use
 ```bash
+portbook run --project webapp -- npm run dev # ONE command: reserve → $PORT → run → release on exit
 portbook reserve --project webapp --port 4100 --purpose "api origin" --owner claude
 portbook reserve --project api --count 1 --range 4200-4299   # auto-pick a free one
 portbook block --project api --range 4200-4299               # claim a range as your territory
@@ -30,10 +31,13 @@ portbook adopt 5432 --project db --purpose "postgres"        # register a port y
 portbook check 4100
 portbook list                                # reserved ports + live BOUND state (yes/no/stale)
 portbook scan --range 4000-9000              # what's ACTUALLY listening; flags unmanaged ports
+portbook log                                 # audit trail: who reserved/released/reclaimed what, when
+portbook doctor                              # health report — nonzero exit on problems (CI-friendly)
 portbook env                                 # full ecosystem: host ports + containers + WSL
 portbook serve --open                        # live web dashboard at http://localhost:7800
+portbook renew --project api --ttl 3600      # extend a TTL hold in place
 portbook release --project api
-portbook gc                                  # reclaim dead-PID / expired holds
+portbook gc                                  # reclaim dead-PID / expired / PID-reused holds
 portbook where                               # registry file path
 ```
 `reserve` prints the granted port(s) to stdout, so scripts can capture them:
@@ -54,9 +58,26 @@ you can see your whole port picture at a glance and spot collisions before they 
 > **Reservations are permanent by default.** A plain `reserve` lives until you `release` it — it is
 > *never* auto-reclaimed. What makes a hold *ephemeral* (auto-freed by `gc` / the next `reserve`) is
 > attaching a lifetime: `--pid <serverPid>` frees it when that process dies, and `--ttl <seconds>`
-> frees it when the clock runs out. A reservation with **neither** a PID nor a TTL is permanent — use
-> that for a project's long-lived origins, and a PID/TTL for throwaway or agent-spawned servers so a
-> crash can't leak the port.
+> frees it when the clock runs out (`portbook renew --ttl <s>` extends a TTL hold that's still
+> needed, in place — no release/re-reserve race). A reservation with **neither** a PID nor a TTL is
+> permanent — use that for a project's long-lived origins, and a PID/TTL for throwaway or
+> agent-spawned servers so a crash can't leak the port. PID holds record the process's *start time*
+> too, so a recycled PID number can't quietly impersonate a dead server (`gc` unmasks it).
+
+### One command: `portbook run`
+The reserve → bind → release discipline only works if everyone follows every step — so `run` collapses
+the whole lifecycle into one step that can't be half-followed:
+
+```bash
+portbook run --project webapp -- npm run dev        # picks a free port, runs with PORT=<it>
+portbook run --project api --port 4100 -- ./serve --port {port}   # {port} substitutes in argv too
+```
+
+It reserves a port (auto-picked, or `--port`/`--range` yours), exports it as `$PORT` (rename with
+`--env`, plus `PORTBOOK_PORT`/`PORTBOOK_PROJECT` always), runs your command with stdio passed
+through, and **releases the hold when the command exits** — Ctrl-C, crash, or clean exit. The hold
+carries the wrapper's own PID, so even a hard-killed wrapper can't leak the port past the next
+`gc`/`reserve`. Exit code passes through, so scripts and CI wrap cleanly.
 
 ## Port territory (blocks)
 Reserving one port at a time works, but for a project with several long-lived services it's cleaner
@@ -96,12 +117,17 @@ portbook request --port 5173 --from webapp --reason "vite default"   # file the 
 portbook inbox --project api                 # the HOLDER: pending asks against your ports
 portbook grant <id> --note "all yours"       # …or: portbook deny <id> --note "still using it"
 portbook requests --from webapp              # the REQUESTER: poll your filings for the verdict
+portbook request --port 5173 --from webapp --wait --timeout 300      # …or don't poll: BLOCK for the
+                                             # verdict; a grant is claimed automatically and the port
+                                             # printed (exit 1 on deny/timeout, with the holder's note)
 ```
 
 A **grant** releases the holder's reservation in the same locked write and holds the port for the
 requester until they `reserve` it; if the port was only block-territory, the grant is a one-shot
 exemption through that block instead (the territory survives). A **deny** leaves the verdict + note
 in the requester's outbox. Resolved requests age out after ~a day, unanswered ones after ~a week.
+So a pending ask can't rot unseen, `portbook list` nags the holder — a `• N pending port request(s)`
+line under the table — right where they already look.
 The same verbs exist as MCP tools and HTTP routes ([docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)) —
 and they're the conflict-resolution half of the **cubicle pattern** for running many agents on one
 machine: **[docs/CUBICLES.md](docs/CUBICLES.md)**.
@@ -119,6 +145,50 @@ daemon, a server you started by hand. Two commands handle that:
   any reservation, is permanent until you `release` it. (`portbook reserve --port <p> --adopt` is the
   same operation spelled as a flag.)
 
+### Audit trail (`portbook log`)
+portbook was born from "an agent silently killed another project's servers" — and the registry's
+current-state snapshot can't answer *who freed this port and when*. The audit trail can: every
+mutation (reserve, release, renew, gc **with the reason** — TTL expired, dead PID, PID reused —
+block claims, request/grant/deny, expose) is appended to `~/.portbook/events.jsonl` in the same
+locked write that performs it.
+
+```bash
+portbook log                          # the trail, oldest → newest
+portbook log --port 5173              # everything that ever touched one port
+portbook log --project api --op gc    # filters AND; --limit caps; --json for scripts
+```
+
+Logging is strictly best-effort (an events hiccup never fails the operation it describes) and the
+file rotates at ~1 MiB with one kept generation, so it can't grow unbounded.
+
+### Health check (`portbook doctor`)
+One command, one exit code to gate CI or a shell prompt on:
+
+```bash
+portbook doctor          # exit 0 = healthy; exit 1 = problems (listed loudly)
+```
+
+**Problems** (nonzero exit): an unreserved process listening inside another project's block
+territory; an unreachable fleet server; tailscale-origin collisions/drift (dual-claimed HTTPS ports,
+serve targets that moved, origins fronting ports the project doesn't hold) and untracked serve
+mappings. **Notes** (informational): stale holds `gc` will reclaim, ghosts (reserved, nothing
+listening), and ports listening inside WSL that overlap reservations.
+
+### Tailnet staging origins (`portbook expose`)
+Serving an app to your tailnet with `tailscale serve` has the same collision problem ports do — one
+MagicDNS host, many apps, and service workers/PWAs are origin-scoped — so portbook manages those
+origins like ports:
+
+```bash
+portbook expose --project webapp --port 5180   # reserve :5180 + serve it → prints https://<host>:8443
+portbook origins                               # every tracked origin, checked against live serve state
+portbook release --project webapp              # tears the serve mapping down with the reservation
+```
+
+`expose` reserves the local port, picks (or takes via `--https`) a dedicated tailscale HTTPS port,
+runs `tailscale serve`, and records the public origin — idempotent, so re-running keeps the same
+URL. `doctor` reconciles the records against live serve state.
+
 ### Ecosystem view & dashboard
 `portbook env` widens the lens to your whole machine: host listeners **plus** the containers running
 under Docker / Rancher / nerdctl — each host port labeled with the container that owns it (e.g.
@@ -133,12 +203,12 @@ Tailscale IP (`--bind`) and the very same process becomes the shared registry fo
 > [docs/FLEET.md](docs/FLEET.md).
 
 ## How it works
-- **Storage:** one JSON at `~/.portbook/registry.json` (override with `PORTBOOK_DIR`). Each entry records who/why/PID/TTL plus the `machine` (hostname) that holds it.
+- **Storage:** one JSON at `~/.portbook/registry.json` (override with `PORTBOOK_DIR`). Each entry records who/why/PID/TTL plus the `machine` (hostname) that holds it; every mutation is also appended to `events.jsonl` (the audit trail).
 - **Concurrency-safe:** an atomic `mkdir` lock serializes reserve/release across processes. The holder stamps the lock with an owner token and heartbeats it while it works, so releases only ever remove the holder's own lock — and a crashed holder's lock (no heartbeat for >15s) is taken over atomically by exactly one waiter. Writes are atomic (temp + rename).
-- **OS-reconciled:** `reserve` verifies a port is genuinely free at the OS level before granting; `list`/`scan` read the live listener table to show what's truly bound; `gc` (and every `reserve`) reclaims reservations whose PID is dead or whose TTL expired. `list`/`scan` never mutate — only `reserve`/`release`/`gc` do.
+- **OS-reconciled:** `reserve` verifies a port is genuinely free at the OS level before granting — including ports listening **inside running WSL distros** (WSL2 shares the host's effective localhost namespace, and the host's own bind test can succeed on a port a distro is serving, silently shadowing it; skip the probe with `PORTBOOK_NO_WSL=1`). `list`/`scan` read the live listener table to show what's truly bound (`scan` folds in-WSL listeners in, labeled `wsl:<distro>`); `gc` (and every `reserve`) reclaims reservations whose PID is dead, whose TTL expired — or whose PID number was recycled by an unrelated process (holds record the PID's *start time*, so a reused number can't impersonate a dead server). `list`/`scan` never mutate — only `reserve`/`release`/`renew`/`gc` do.
 
 ## For AI agents
-See **[AGENTS.md](./AGENTS.md)** — the one rule that makes this work: *never hardcode a port; reserve first, release on stop.* Drop that section into your project's `CLAUDE.md` / `AGENTS.md`.
+See **[AGENTS.md](./AGENTS.md)** — the one rule that makes this work: *never hardcode a port; reserve first, release on stop* (or just `portbook run` and get all of it in one command). `portbook init` prints the drop-in convention block for a project's `CLAUDE.md` / `AGENTS.md` (`--write` appends it for you). For Claude Code, the [PreToolUse hook](integrations/claude-code/) turns the convention into actual **enforcement** — commands that would kill or bind another project's reserved port are denied with the correct next step in the reason.
 Running a whole fleet of agents in parallel on one machine (worktrees / containers / VMs)? The
 cubicle pattern — isolation walls plus a shared port ledger — is in **[docs/CUBICLES.md](docs/CUBICLES.md)**.
 
@@ -147,10 +217,13 @@ Drive portbook from the tools you already use — all thin clients over the same
 Full guide: **[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)**.
 
 - **AI agent harnesses** (Claude Code, Codex, Cursor, Windsurf, Hermes) — the **MCP server**: `portbook mcp`
-  speaks JSON-RPC over stdio and exposes `reserve`/`release`/`list`/`check`/`scan`/`ecosystem`/`gc` —
+  speaks JSON-RPC over stdio and exposes `reserve`/`release`/`renew`/`list`/`check`/`scan`/`ecosystem`/`gc`/`log` —
   plus the block-territory tools `reserve_block`/`list_blocks`/`release_block` and the negotiation
   tools `request_port`/`inbox`/`my_requests`/`grant_request`/`deny_request` — as tools.
   Config + per-client setup in [integrations/mcp/](integrations/mcp/) (e.g. `claude mcp add portbook -- portbook mcp`).
+- **Claude Code enforcement** — a zero-dependency **PreToolUse hook** that denies Bash commands which
+  would kill or bind a port another project reserved (and, in strict mode, any unreserved bind):
+  [integrations/claude-code/](integrations/claude-code/).
 - **VS Code / Cursor / Windsurf / VSCodium** — a thin, buildless extension (status bar + live Ports
   view), published as `portbook.portbook` on both the
   [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=portbook.portbook) and
@@ -183,11 +256,20 @@ Details + the "reporter inside a VM" model: **[docs/FLEET.md](docs/FLEET.md)**.
 ## Limitations
 Worth knowing before you lean on it:
 
-- **It's a cooperative convention, not enforcement.** portbook coordinates well-behaved servers and
+- **It's a cooperative convention, not OS enforcement.** portbook coordinates well-behaved servers and
   agents; it does **not** stop a process from binding a free port it never reserved — the OS still
   hands any port to anyone who asks. The value comes entirely from *everyone* on a machine actually
-  reserving first. One tool that hardcodes `3000` can still clobber a reservation. Treat `list`/`scan`
-  as the shared map, not a lock.
+  reserving first. Two things narrow the gap: `portbook run` makes compliance a single command, and
+  the [Claude Code hook](integrations/claude-code/) blocks non-compliant commands *inside that
+  harness* — but one tool that hardcodes `3000` outside any harness can still clobber a reservation.
+  Treat `list`/`scan` as the shared map, not a lock.
+- **WSL2 shares the host's localhost — handled, with edges.** A server inside a WSL2 distro is
+  reachable (and collidable) on the Windows host's `127.0.0.1`, so `reserve` treats ports listening
+  inside **running** distros as taken and `scan`/`doctor` surface them (`wsl:<distro>`). Edges: a
+  **stopped** distro is never probed (probing would boot it), in-distro listeners bound only to the
+  distro's own loopback are counted as taken even though some WSL configs don't forward them
+  (portbook errs toward safety), and the probe adds a moment to `reserve` on Windows — set
+  `PORTBOOK_NO_WSL=1` to skip it entirely.
 - **OS & container detection is best-effort.** Liveness and ecosystem views shell out to the tools you
   already have (`ss`/`lsof`/PowerShell/`netstat` for listeners; `docker`/`nerdctl`/`podman` and `wsl`
   for sub-environments). Output formats vary by version and platform, and a tool that's absent, slow,

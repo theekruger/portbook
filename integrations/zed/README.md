@@ -43,9 +43,9 @@ On **Windows**, if Zed fails to spawn the `portbook` shim, point at node + the s
 ```
 
 Verify: Agent Panel → settings — the dot next to **portbook** should be green ("Server is active").
-The agent then has all fifteen tools (`reserve`, `release`, `list`, `check`, `scan`, `ecosystem`,
-`gc`, the `*_block` territory tools, and the `request_port`/`inbox`/`my_requests`/`grant_request`/
-`deny_request` negotiation tools — see [integrations/mcp/](../mcp/)). Pair it with the agent
+The agent then has all seventeen tools (`reserve`, `release`, `renew`, `list`, `check`, `scan`,
+`ecosystem`, `gc`, `log`, the `*_block` territory tools, and the `request_port`/`inbox`/
+`my_requests`/`grant_request`/`deny_request` negotiation tools — see [integrations/mcp/](../mcp/)). Pair it with the agent
 etiquette in [AGENTS.md](../../AGENTS.md) (drop it into your Zed rules) so the agent *reserves before
 it binds* and *asks instead of killing* what's on a port.
 

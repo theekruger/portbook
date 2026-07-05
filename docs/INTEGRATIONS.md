@@ -7,6 +7,7 @@ surface fits the tool:
 | You're using…                              | Use this surface              | Lives in                              |
 |--------------------------------------------|-------------------------------|---------------------------------------|
 | An MCP agent (Claude Code, Codex, Cursor, Windsurf, Hermes) | **MCP server** (`portbook mcp`) | [`integrations/mcp/`](../integrations/mcp/)         |
+| Claude Code (enforcement, not just tools)  | **PreToolUse hook**           | [`integrations/claude-code/`](../integrations/claude-code/) |
 | VS Code (or Cursor / Windsurf, both VS Code forks) | **VS Code extension**         | [`integrations/vscode/`](../integrations/vscode/)   |
 | Zed                                        | **MCP (Agent Panel)** + tasks | [`integrations/zed/`](../integrations/zed/)         |
 | JetBrains IDEs (IntelliJ, WebStorm, …)     | **External Tools** (CLI)      | [`integrations/jetbrains/`](../integrations/jetbrains/) |
@@ -26,7 +27,7 @@ outside, through configuration you already own. In rough order of preference:
 
 1. **MCP (works almost everywhere).** MCP servers are **user-configured**, not vendor-shipped: drop
    the [`mcp.json`](../integrations/mcp/mcp.json) block into the harness's MCP settings and it gains
-   portbook's fifteen tools — no cooperation from the harness's author required. Claude Code, Codex,
+   portbook's seventeen tools — no cooperation from the harness's author required. Claude Code, Codex,
    Cursor, Windsurf, Copilot CLI, and effectively every modern agent harness speak MCP.
 2. **ACP editors get it for free, via MCP.** The [Agent Client Protocol](https://agentclientprotocol.com)
    connects editors (Zed, JetBrains AI Assistant, Neovim plugins) to any ACP agent — and when an ACP
@@ -35,26 +36,33 @@ outside, through configuration you already own. In rough order of preference:
    need to speak ACP itself.
 3. **Instruction files, for convention-following.** Harnesses that read `AGENTS.md` / `CLAUDE.md` /
    global rules will follow the *reserve-before-bind* convention with the plain CLI, even with no MCP
-   at all. Drop the rule from [AGENTS.md](../AGENTS.md) into your global agent instructions
+   at all. `portbook init` prints the canonical drop-in block (`--write` appends it to a project's
+   `AGENTS.md`); put the same block in your global agent instructions
    (e.g. `~/.claude/CLAUDE.md`, Windsurf's `global_rules.md`).
-4. **CLI + HTTP, the universal floor.** Any harness that can run a shell command can
+4. **Hooks, for actual enforcement (Claude Code today).** Harness hooks can *block* a non-compliant
+   command, not just advise against it. The
+   [Claude Code PreToolUse hook](../integrations/claude-code/) denies commands that would kill or
+   bind a port another project has reserved (pointing the agent at `portbook request`), and can
+   require reserve-before-bind outright with `PORTBOOK_HOOK_MODE=strict`.
+5. **CLI + HTTP, the universal floor.** Any harness that can run a shell command can
    `portbook reserve … --json`; anything that can only make web requests can use the
    [HTTP API](#http-api) from `portbook serve`. No integration code anywhere.
 
-One honest caveat applies to all four: portbook is a *cooperative* convention (see
+One honest caveat: portbook is a *cooperative* convention (see
 [Limitations](../README.md#limitations)) — these paths make it available to a foreign harness, and the
-instruction layer makes it *likely* to be followed, but nothing forces a process to reserve before it
-binds.
+instruction layer makes it *likely* to be followed. Only the hook layer (4) actually blocks a
+non-compliant command, and only inside the harness that runs the hook; a process outside any harness
+can still bind whatever the OS allows.
 
 ## MCP server
 
 For any **MCP-aware** harness. The client spawns `portbook mcp` and talks
-newline-delimited JSON-RPC 2.0 over stdio; the server exposes fifteen tools —
-`reserve`, `release`, `list`, `check`, `scan`, `ecosystem`, `gc`, the block-territory tools
-`reserve_block`, `list_blocks`, `release_block`, and the port-negotiation tools `request_port`,
-`inbox`, `my_requests`, `grant_request`, `deny_request` (ask for a held port; the holder grants —
-releasing the hold, or opening a one-shot exemption through its block — or denies with a note) —
-mirroring the library and HTTP APIs.
+newline-delimited JSON-RPC 2.0 over stdio; the server exposes seventeen tools —
+`reserve`, `release`, `renew`, `list`, `check`, `scan`, `ecosystem`, `gc`, `log` (the audit trail),
+the block-territory tools `reserve_block`, `list_blocks`, `release_block`, and the port-negotiation
+tools `request_port`, `inbox`, `my_requests`, `grant_request`, `deny_request` (ask for a held port;
+the holder grants — releasing the hold, or opening a one-shot exemption through its block — or denies
+with a note) — mirroring the library and HTTP APIs.
 
 Ready-to-copy config and per-harness setup blocks (Claude Code, Codex, Cursor, Windsurf, Hermes, and
 a generic stdio entry) are in **[integrations/mcp/](../integrations/mcp/)**:
@@ -124,6 +132,7 @@ browser dashboard can call it.
 | `GET /api/requests`        | `?project=<name>` → that project's pending **inbox**; `?from=<name>` (alone — `?project=` wins if both are sent) → that requester's **outbox** (all statuses, newest first); `?machine=<m>` scopes the inbox (fleet clients pass their own); no params → every pending ask | pending requests / the requester's filings |
 | `POST /api/reserve`        | JSON body = reserve opts (`project` required; `machine`/`probe` for fleet) | the reservation(s) made |
 | `POST /api/release`        | JSON body `{ port \| project \| id, machine? }` | `{ released: <count> }` |
+| `POST /api/renew`          | JSON body `{ port \| project \| id, ttlSec, machine? }` — extend a TTL hold in place (permanent holds are never touched) | the renewed rows |
 | `POST /api/blocks`         | JSON body `{ project, rangeStart, rangeEnd, owner?, purpose?, machine? }` | the block made |
 | `POST /api/blocks/release` | JSON body `{ id \| project, machine? }` | `{ released: <count> }` |
 | `POST /api/requests`       | JSON body `{ port, fromProject, fromOwner?, reason?, machine? }` — ask for a **held** port instead of clobbering | the request filed (`status: "pending"`; re-filing an identical pending ask returns the existing row) |

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { reserve, release, list, check, gc, scan, annotate, machineName, FILE, reserveBlock, releaseBlock, listBlocks, blockAt, requestPort, inbox, outbox, resolveRequest, addOrigin, listOrigins, originsFor } from "../src/registry.js";
+import { reserve, release, renew, list, check, gc, scan, annotate, machineName, FILE, reserveBlock, releaseBlock, listBlocks, blockAt, requestPort, inbox, outbox, resolveRequest, addOrigin, listOrigins, originsFor, readEvents } from "../src/registry.js";
 import { ecosystem } from "../src/environments.js";
+import { wslListenerPorts } from "../src/wsl.js";
 import * as tailscale from "../src/tailscale.js";
 
 function parseArgs(argv) {
@@ -29,10 +30,13 @@ function requireInt(name, v) {
 const HELP = `portbook — machine-wide port registry (so agents & servers stop colliding)
 
 Usage:
+  portbook run --project <name> [--port <p>] [--range <a-b>] [--env PORT] [--ttl <s>] -- <cmd> [args...]
+                                                            # reserve → run cmd with $PORT set → release on exit
   portbook reserve --project <name> [--port <p> | --count <n>] [--range <a-b>]
                    [--purpose "..."] [--owner <agent>] [--pid <pid>] [--ttl <seconds>] [--adopt] [--json]
   portbook release (--project <name> | --port <p> | --id <id>)
   portbook release (--block <id> | --project <name> --blocks)  # release reserved port block(s)
+  portbook renew (--project <name> | --port <p> | --id <id>) --ttl <seconds>  # extend a TTL hold in place
   portbook adopt <port> [--project <p>] [--owner <o>] [--purpose "..."]  # claim a running OS/external port
   portbook expose --project <p> --port <local> [--https <tsPort>] [--owner <o>] [--purpose "..."] [--json]
                                                             # reserve <local> + tailscale-serve it as a tailnet HTTPS origin
@@ -40,14 +44,18 @@ Usage:
   portbook block --project <name> --range <a-b> [--owner <o>] [--purpose "..."]  # claim a port territory
   portbook block --project <name> | portbook blocks [--json]   # list reserved port blocks
   portbook request --port <p> --from <project> [--owner <o>] [--reason "..."] [--json]
-                                                            # a port you need is HELD — ask, don't clobber
+                   [--wait [--timeout <sec>]]               # a port you need is HELD — ask, don't clobber
+                                                            # --wait blocks for the verdict and claims a grant
   portbook inbox [--project <p>] [--json]                   # pending requests against YOUR holds
   portbook requests --from <project> [--json]               # requests you filed, with verdicts (outbox)
   portbook grant <id> [--note "..."] [--json]               # hand the port over / exempt through your block
   portbook deny <id> [--note "..."] [--json]                # refuse it (your note lands in their outbox)
   portbook list [--project <name>] [--json] [--no-probe]    # reserved ports + live OS state
-  portbook scan [--range <a-b>] [--json]                    # what's ACTUALLY listening on this machine
-  portbook doctor [--json]                                  # warn about UNMANAGED / collided tailscale-serve origins
+  portbook scan [--range <a-b>] [--json]                    # what's ACTUALLY listening (host + inside WSL)
+  portbook log [--project <p>] [--port <p>] [--op <op>] [--limit <n>] [--json]
+                                                            # the audit trail: who reserved/released/reclaimed what, when
+  portbook doctor [--json]                                  # health report: stale holds, block intrusions,
+                                                            # WSL overlaps, fleet reachability, tailscale origins
   portbook env [--json]                                     # full ecosystem: host + containers + WSL
   portbook serve [--port 7800] [--bind 127.0.0.1] [--open]  # live web dashboard (zero-dependency)
   portbook mcp                                              # MCP stdio server (JSON-RPC) for AI agent harnesses
@@ -56,6 +64,8 @@ Usage:
   portbook fleet                                            # all machines' reservations (needs PORTBOOK_SERVER)
   portbook report                                           # push this machine's ecosystem to the fleet server
   portbook import [--json]                                  # migrate this machine's LOCAL reservations into the fleet server
+  portbook init [--write] [--file AGENTS.md]                # print (or append to a file) the agent port convention
+  portbook completion (bash|zsh|pwsh)                       # emit a tab-completion script for your shell
   portbook where                                            # print the registry file path (or server URL in fleet mode)
 
 Fleet mode: set PORTBOOK_SERVER=http://<host>:7800 and every ledger command (reserve, release, list,
@@ -63,6 +73,7 @@ check, gc, block/blocks, request/inbox/requests/grant/deny) coordinates against 
 PORTBOOK_MACHINE overrides this machine's name. See docs/FLEET.md.
 
 Examples:
+  portbook run --project webapp -- npm run dev              # the whole lifecycle in one command
   portbook reserve --project webapp --port 4100 --purpose "api origin" --owner claude
   PORT=$(portbook reserve --project api --count 1 --range 4200-4299)
   portbook block --project api --range 4200-4299            # claim a range; api's auto-picks land here
@@ -73,6 +84,67 @@ Examples:
   portbook env                                              # containers labeled by name/image
   portbook serve --open                                     # open the dashboard in your browser
   portbook scan --range 4000-9000`;
+
+// The canonical drop-in convention block for a project's AGENTS.md / CLAUDE.md — what `portbook init`
+// prints. Self-contained on purpose: a new repo (or machine) gets the whole rule without hunting for
+// this repo's AGENTS.md.
+const CONVENTION = `## Ports — coordinate through \`portbook\`
+
+Multiple projects and AI agents run servers on this machine. Never hardcode a port — reserve one
+first, against the shared machine-wide registry (\`portbook\` is on PATH).
+
+- **Preferred: run through the wrapper** — reserve + inject + release in one step:
+  \`portbook run --project <name> -- npm run dev\` (the port arrives as \`$PORT\`; \`{port}\` in the
+  command substitutes too).
+- Or reserve explicitly and bind exactly what it prints:
+  \`PORT=$(portbook reserve --project <name> --count 1 --owner <agent> --purpose "<what>")\`.
+  Claim a specific port with \`--port <p>\` (fails loudly if taken).
+- **Make agent-spawned holds ephemeral**: add \`--pid <serverPid>\` or \`--ttl <seconds>\` so a crash
+  can't leak the port; \`portbook renew --ttl <s>\` extends a TTL hold that's still needed.
+- **Release on stop**: \`portbook release --project <name>\` (or \`--port <p>\`).
+- **Before touching a port you didn't reserve**: \`portbook check <port>\`, \`portbook list\`,
+  \`portbook scan\`. **Never kill a process to free its port** — ask through the ledger instead:
+  \`portbook request --port <p> --from <name> --reason "<why>" --wait\` blocks until the holder
+  grants (you get the port) or denies.
+- Answer asks against your own holds: \`portbook inbox\`, then \`portbook grant <id>\` or
+  \`portbook deny <id> --note "<why>"\`.
+- \`portbook log\` is the audit trail (who reserved/released/reclaimed what, when);
+  \`portbook doctor\` is the health check. Add \`--json\` to any read for scripting.
+`;
+
+// Verb + flag vocab for `portbook completion` — keep in sync with HELP above.
+const VERBS = "run reserve release renew adopt expose origins block blocks request inbox requests grant deny list scan log doctor env serve mcp check gc fleet report import init completion where help";
+const FLAGS = "--project --port --count --range --purpose --owner --pid --ttl --adopt --json --from --reason --wait --timeout --note --id --block --blocks --https --env --op --limit --file --write --bind --open --no-probe --help";
+const COMPLETIONS = {
+  bash: `# portbook bash completion — eval "$(portbook completion bash)" or drop in /etc/bash_completion.d/
+_portbook() {
+  local cur=\${COMP_WORDS[COMP_CWORD]}
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=( $(compgen -W "${VERBS}" -- "$cur") )
+  else
+    COMPREPLY=( $(compgen -W "${FLAGS}" -- "$cur") )
+  fi
+}
+complete -F _portbook portbook`,
+  zsh: `# portbook zsh completion — eval "$(portbook completion zsh)" or add to a compinit'd fpath file
+_portbook() {
+  if (( CURRENT == 2 )); then
+    compadd ${VERBS}
+  else
+    compadd -- ${FLAGS}
+  fi
+}
+compdef _portbook portbook`,
+  pwsh: `# portbook PowerShell completion — portbook completion pwsh | Out-String | Invoke-Expression
+Register-ArgumentCompleter -Native -CommandName portbook -ScriptBlock {
+  param($wordToComplete, $commandAst, $cursorPosition)
+  $verbs = "${VERBS}" -split " "
+  $flags = "${FLAGS}" -split " "
+  $set = if ($commandAst.CommandElements.Count -le 2 -and -not $wordToComplete.StartsWith("-")) { $verbs } else { $flags }
+  $set | Where-Object { $_ -like "$wordToComplete*" } |
+    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, "ParameterValue", $_) }
+}`,
+};
 
 function fmt(rows) {
   if (!rows.length) return "(no reservations)";
@@ -146,6 +218,25 @@ function fmtOutbox(rows) {
   return [head, ...lines, ...(notes.length ? ["", ...notes] : [])].join("\n");
 }
 
+// Render the audit trail, oldest → newest (so the terminal ends at "what just happened"). DETAIL
+// folds in whichever event fields exist — owner, gc reason, grant/deny target + note, ttl, origin url.
+function fmtLog(rows) {
+  if (!rows.length) return "(no events yet — the trail starts with the next reserve/release/gc)";
+  const pad = (s, n) => String(s ?? "").padEnd(n);
+  const detail = (e) => [
+    e.owner && `by ${e.owner}`,
+    e.reason && (e.op === "gc" ? `(${e.reason})` : `reason: ${e.reason}`),
+    e.pid && e.op === "gc" && `pid ${e.pid}`,
+    // request/grant/deny events key PROJECT to the requester; target is the holder being asked.
+    e.target && `${e.op === "request" ? "asked of" : "answered by"} "${e.target}"`,
+    e.note && `note: ${e.note}`,
+    e.ttlSec && `ttl ${e.ttlSec}s`, e.range && e.range, e.url && e.url,
+  ].filter(Boolean).join(" ");
+  const head = `${pad("WHEN", 8)} ${pad("OP", 15)} ${pad("PORT", 6)} ${pad("PROJECT", 16)} DETAIL`;
+  const lines = rows.map((e) => `${pad(age(e.at) + " ago", 8)} ${pad(e.op, 15)} ${pad(e.port ?? "-", 6)} ${pad(e.project ?? "-", 16)} ${detail(e)}`);
+  return [head, ...lines].join("\n");
+}
+
 // Render `portbook fleet` — reservations grouped by machine + what each machine last reported.
 function fmtFleet(f) {
   const pad = (s, n) => String(s ?? "").padEnd(n);
@@ -207,31 +298,37 @@ function fmtOrigins(rows) {
   return [head, ...lines, ...notes].join("\n");
 }
 
-// Render `portbook doctor`: the tailscale-origin health report. Loud about the two failure classes —
-// serve mappings tailscale runs that portbook doesn't track (UNMANAGED), and origins/local ports that
-// are dual-claimed or whose local port belongs to a different project (the collision class).
+// Render `portbook doctor`: the whole-registry health report. PROBLEMS are actionable failures
+// (block intrusions, origin collisions, unreachable fleet server) and drive the nonzero exit;
+// NOTES are self-healing or ambiguous states (stale holds, ghosts, WSL overlaps) worth a look.
 function fmtDoctor(d) {
   const pad = (s, n) => String(s ?? "").padEnd(n);
   const L = [`machine: ${d.machine}`];
-  if (!d.tailscale) {
-    L.push("", "tailscale: UNAVAILABLE — " + (d.tailscaleError || "could not query `tailscale`") + " (origin checks skipped)");
-    return L.join("\n");
-  }
-  L.push(`tailscale: ${d.serving.length} serve mapping(s), ${d.origins.length} tracked origin(s)`, "");
-  if (!d.unmanaged.length && !d.problems.length) {
-    L.push("OK — every tailscale serve origin is tracked in portbook, no collisions.");
+  if (d.fleet) L.push(`fleet: ${d.fleet.server} — ${d.fleet.reachable ? "reachable" : "UNREACHABLE"}`);
+  L.push(`registry: ${d.reservations} reservation(s) · ${d.stale.length} stale · ${d.ghosts} ghost(s) · ${d.wsl.length} port(s) inside WSL`);
+  L.push(d.tailscale
+    ? `tailscale: ${d.serving.length} serve mapping(s), ${d.origins.length} tracked origin(s)`
+    : `tailscale: unavailable${d.origins.length ? ` — ${d.origins.length} tracked origin(s) NOT verified` : ""}`);
+  L.push("");
+  if (!d.unmanaged.length && !d.problems.length && !d.notes.length) {
+    L.push("OK — no problems found.");
     return L.join("\n");
   }
   if (d.unmanaged.length) {
-    L.push(`UNMANAGED (${d.unmanaged.length}) — tailscale is serving these, but portbook isn't tracking them:`);
+    L.push(`UNMANAGED ORIGINS (${d.unmanaged.length}) — tailscale is serving these, but portbook isn't tracking them:`);
     for (const m of d.unmanaged) L.push(`  ${pad(m.url, 44)} → http://127.0.0.1:${m.localPort ?? "?"}   (adopt: \`portbook expose --project <p> --port ${m.localPort ?? "<local>"} --https ${m.tsPort}\`)`);
     L.push("");
   }
   if (d.problems.length) {
-    L.push(`COLLISIONS (${d.problems.length}) — surfaced loudly:`);
+    L.push(`PROBLEMS (${d.problems.length}):`);
     for (const p of d.problems) L.push(`  ! ${p}`);
+    L.push("");
   }
-  return L.join("\n").replace(/\n$/, "");
+  if (d.notes.length) {
+    L.push(`NOTES (${d.notes.length}):`);
+    for (const n of d.notes) L.push(`  • ${n}`);
+  }
+  return L.join("\n").replace(/\n+$/, "");
 }
 
 // Strict `--range a-b`: both bounds must be positive integers (e.g. 4200-4299) — anything else exits 1.
@@ -284,12 +381,16 @@ function openBrowser(url) {
 async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
-  const a = parseArgs(argv.slice(1));
+  // Everything after a bare `--` is the CHILD COMMAND for `portbook run` — carve it off before flag
+  // parsing so its own flags (e.g. `npm run dev --port 3000`) are never mistaken for ours.
+  const sep = argv.indexOf("--");
+  const childArgv = sep >= 0 ? argv.slice(sep + 1) : null;
+  const a = parseArgs((sep >= 0 ? argv.slice(0, sep) : argv).slice(1));
   // Fleet mode: when $PORTBOOK_SERVER is set, ledger ops (reserve/release/list/check/gc, blocks, and
   // the request flow) go to the shared server; scan/env/serve stay local (they describe THIS machine).
   // See docs/FLEET.md.
   const remote = process.env.PORTBOOK_SERVER ? await import("../src/client.js") : null;
-  const reg = remote || { reserve, release, list, check, gc, reserveBlock, releaseBlock, listBlocks, requestPort, inbox, outbox, resolveRequest };
+  const reg = remote || { reserve, release, renew, list, check, gc, reserveBlock, releaseBlock, listBlocks, requestPort, inbox, outbox, resolveRequest };
   try {
     if (!cmd || cmd === "help" || a.help) { console.log(HELP); return; }
     if (cmd === "where") { console.log(remote ? process.env.PORTBOOK_SERVER : FILE); return; }
@@ -302,6 +403,74 @@ async function main() {
         pid: requireInt("--pid", a.pid), ttlSec: requireInt("--ttl", a.ttl), rangeStart, rangeEnd, adopt: !!a.adopt,
       });
       console.log(a.json ? JSON.stringify(made, null, 2) : made.map((m) => m.port).join("\n"));
+      return;
+    }
+    if (cmd === "run") {
+      // The whole port lifecycle in ONE command — reserve, inject, record, release — so the right
+      // thing is also the lazy thing (each step someone must remember is a step that gets skipped):
+      //   portbook run --project webapp -- npm run dev
+      // reserves a port, exports it as $PORT (rename via --env; `{port}` in the command substitutes
+      // too), runs the command with stdio passed through, and releases the hold when it exits —
+      // Ctrl-C included. The hold carries OUR pid (we live exactly as long as the child), so even a
+      // hard-killed wrapper can't leak the port past the next gc/reserve.
+      if (!a.project || typeof a.project !== "string") throw new Error("run requires --project <name>");
+      if (!childArgv || !childArgv.length) throw new Error("run requires a command after `--`, e.g. `portbook run --project webapp -- npm run dev`");
+      const [rangeStart, rangeEnd] = parseRange(a.range);
+      const made = await reg.reserve({
+        project: a.project, port: requireInt("--port", a.port), count: 1,
+        purpose: (typeof a.purpose === "string" ? a.purpose : null) || `run: ${childArgv.join(" ").slice(0, 60)}`,
+        owner: typeof a.owner === "string" ? a.owner : null,
+        pid: process.pid, ttlSec: requireInt("--ttl", a.ttl), rangeStart, rangeEnd,
+      });
+      const { port, id } = made[0];
+      const envName = typeof a.env === "string" ? a.env : "PORT";
+      const [cmd0, ...args] = childArgv.map((s) => s.replaceAll("{port}", String(port)));
+      console.error(`portbook: reserved ${port} for "${a.project}" — ${envName}=${port} ${cmd0}${args.length ? " " + args.join(" ") : ""}`);
+      const { spawn } = await import("node:child_process");
+      const env = { ...process.env, [envName]: String(port), PORTBOOK_PORT: String(port), PORTBOOK_PROJECT: a.project };
+      // Direct spawn first — exact argv, no shell quoting hazards. Windows `.cmd` shims (npm, npx,
+      // pnpm…) aren't directly spawnable and surface ENOENT — those retry through cmd.exe, with each
+      // arg quoted so spaces survive the shell's re-join.
+      let child = spawn(cmd0, args, { stdio: "inherit", env });
+      // Ctrl-C reaches the child through the shared terminal too — forwarding covers detached cases;
+      // we DON'T exit here, so the normal exit path below still releases the hold.
+      for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { try { child.kill(sig); } catch { /* already gone */ } });
+      const code = await new Promise((resolve) => {
+        const done = (c, sig) => resolve(sig ? 1 : (c ?? 1));
+        const fail = (e) => { console.error(`portbook: could not start command: ${e?.message || e}`); resolve(127); };
+        child.on("exit", done);
+        child.on("error", (e) => {
+          if (process.platform !== "win32" || e?.code !== "ENOENT") return fail(e);
+          const q = (s) => (/[\s&|<>^"]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s);
+          child = spawn([cmd0, ...args].map(q).join(" "), { stdio: "inherit", env, shell: true });
+          child.on("exit", done);
+          child.on("error", fail);
+        });
+      });
+      try { await reg.release({ id }); console.error(`portbook: released ${port}`); }
+      catch (e) { console.error(`portbook: release failed (${e?.message || e}) — the hold carries pid ${process.pid} and will be reclaimed by gc`); }
+      process.exitCode = code;
+      return;
+    }
+    if (cmd === "renew") {
+      const renewed = await reg.renew({
+        project: a.project, port: requireInt("--port", a.port), id: typeof a.id === "string" ? a.id : undefined,
+        ttlSec: requireInt("--ttl", a.ttl),
+      });
+      if (a.json) { console.log(JSON.stringify(renewed, null, 2)); return; }
+      console.log(renewed.length
+        ? `renewed ${renewed.length} hold(s) until ${renewed[0].expiresAt}`
+        : "renewed 0 holds — renew only extends TTL holds (a permanent reservation needs no renewal); check `portbook list`");
+      return;
+    }
+    if (cmd === "log") {
+      // The audit trail — local by design: events record what THIS node's registry (or the fleet
+      // server's, when you run `portbook log` on the server host) actually wrote.
+      const rows = readEvents({
+        project: a.project, port: requireInt("--port", a.port),
+        op: typeof a.op === "string" ? a.op : undefined, limit: requireInt("--limit", a.limit) || 200,
+      });
+      console.log(a.json ? JSON.stringify(rows, null, 2) : fmtLog(rows));
       return;
     }
     if (cmd === "adopt") {
@@ -446,14 +615,62 @@ async function main() {
       const port = requireInt("--port", a.port) ?? num(a._[0]);
       if (!port) throw new Error("request requires --port, e.g. `portbook request --port 5173 --from webapp --reason \"vite default\"`");
       if (typeof a.from !== "string") throw new Error("request requires --from <project> — who is asking? The holder sees this in `portbook inbox`");
-      const req = await reg.requestPort({
+      const file = () => reg.requestPort({
         port, fromProject: a.from,
         fromOwner: typeof a.owner === "string" ? a.owner : null,
         reason: typeof a.reason === "string" ? a.reason : null,
       });
-      console.log(a.json ? JSON.stringify(req, null, 2)
-        : `request ${req.id} (${req.status}): port ${req.port} asked of "${req.targetProject}" — verdict shows in \`portbook requests --from ${req.fromProject}\``);
-      return;
+      if (!a.wait) {
+        const req = await file();
+        console.log(a.json ? JSON.stringify(req, null, 2)
+          : `request ${req.id} (${req.status}): port ${req.port} asked of "${req.targetProject}" — verdict shows in \`portbook requests --from ${req.fromProject}\``);
+        return;
+      }
+      // --wait resumes an EXISTING ask first: if a prior filing is already granted (holder released —
+      // re-filing would throw "nothing holds the port") or still pending, poll THAT; file fresh
+      // otherwise. Makes `request --wait` safely re-runnable after an interrupt.
+      const prior = (await reg.outbox({ fromProject: a.from }))
+        .find((q) => q.port === port && (q.status === "pending" || (q.status === "granted" && !q.consumed)));
+      const req = prior || await file();
+      // --wait: negotiation an agent can actually block on. Poll the outbox for the verdict; on
+      // GRANT, claim the port ourselves (reserve consumes the grant) and print it — retrying while
+      // the holder's old server drains off the port — so `--wait` is file-ask-get-port in one call.
+      // DENY / timeout exit nonzero with the reason. Progress goes to stderr; stdout stays the port.
+      const timeoutMs = (requireInt("--timeout", a.timeout) || 300) * 1000;
+      const started = Date.now();
+      console.error(`portbook: waiting on "${req.targetProject}" for port ${port} (request ${req.id}, timeout ${timeoutMs / 1000}s)...`);
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      for (;;) {
+        const cur = (await reg.outbox({ fromProject: a.from })).find((q) => q.id === req.id);
+        if (!cur) throw new Error(`request ${req.id} is gone (aged out?) — re-file it`);
+        if (cur.status === "denied") {
+          console.error(`portbook: DENIED by "${cur.targetProject}"${cur.note ? ` — "${cur.note}"` : ""}; pick another port`);
+          process.exitCode = 1;
+          return;
+        }
+        if (cur.status === "granted") {
+          try {
+            const made = await reg.reserve({
+              project: a.from, port,
+              owner: typeof a.owner === "string" ? a.owner : null,
+              purpose: typeof a.reason === "string" ? a.reason : null,
+            });
+            console.log(a.json ? JSON.stringify(made, null, 2) : String(made[0].port));
+            return;
+          } catch (e) {
+            // Granted in the ledger but the holder's server is still draining off the port — keep
+            // trying inside the timeout; any other failure surfaces immediately.
+            if (!/in use at the OS level|LISTENING inside WSL/.test(e?.message || "")) throw e;
+            console.error(`portbook: granted, but ${e.message} — retrying...`);
+          }
+        }
+        if (Date.now() - started > timeoutMs) {
+          console.error(`portbook: timed out after ${timeoutMs / 1000}s — the ask is still filed; check \`portbook requests --from ${a.from}\` later`);
+          process.exitCode = 1;
+          return;
+        }
+        await sleep(2000);
+      }
     }
     if (cmd === "inbox") {
       const rows = await reg.inbox({ project: a.project }); // await: local inbox() is sync, remote is async
@@ -488,6 +705,12 @@ async function main() {
       const blocks = await reg.listBlocks({ project: a.project });
       const out = [fmt(annotated)];
       if (blocks.length) out.push("", "BLOCKS:", fmtBlocks(blocks));
+      // Attention path for negotiation: a pending ask only works if the holder actually SEES it, and
+      // `list` is where holders already look — so nag here (human output only; best-effort).
+      try {
+        const pending = await reg.inbox({ project: a.project });
+        if (pending.length) out.push("", `• ${pending.length} pending port request(s) against ${a.project ? `"${a.project}"` : "your holds"} — answer with \`portbook inbox\``);
+      } catch { /* inbox unreachable (fleet hiccup) must never break list */ }
       console.log(out.join("\n"));
       return;
     }
@@ -500,21 +723,65 @@ async function main() {
       return;
     }
     if (cmd === "doctor") {
-      // Reconcile live `tailscale serve status` against the portbook ledger and surface, loudly, the
-      // two failure classes the one-origin-per-app rule exists to catch:
-      //   • UNMANAGED — tailscale serves an origin portbook isn't tracking (it can drift / collide
-      //     silently with a tracked one).
-      //   • COLLISIONS — a tsPort dual-claimed by two origins; a tracked origin's serve target that has
-      //     drifted from what tailscale actually serves; or a local port fronted by a tailscale origin
-      //     but owned by a DIFFERENT project in portbook (or not reserved at all).
+      // The whole-registry health report, in one pass with one exit code CI/scripts can gate on:
+      //   PROBLEMS (exit 1): unmanaged listeners squatting inside a project's block territory; an
+      //     unreachable fleet server; and the tailscale-origin collision classes (dual-claimed
+      //     tsPorts, drifted serve targets, origins fronting ports the project doesn't hold).
+      //   NOTES (informational): stale holds gc will reclaim, ghosts (reserved, nothing listening),
+      //     and ports listening inside WSL that overlap reservations (ambiguous — may be the
+      //     project's own server running in the distro).
       const me = machineName();
       const origins = listOrigins();
-      const reservations = await annotate(await reg.list({})); // for the "local port owned by X" cross-check
-      const resByPort = new Map(reservations.filter((r) => !r.machine || r.machine === me).map((r) => [r.port, r]));
+      // Fleet reachability is itself a health check: an unreachable server means every ledger command
+      // on this machine is failing — surface that as THE problem and fall back to the local file.
+      let reservations, fleetInfo = null;
+      try {
+        reservations = await annotate(await reg.list({}));
+        if (remote) fleetInfo = { server: process.env.PORTBOOK_SERVER, reachable: true };
+      } catch (e) {
+        fleetInfo = { server: process.env.PORTBOOK_SERVER, reachable: false, error: e?.message || String(e) };
+        reservations = await annotate(list({}));
+      }
+      const mine = reservations.filter((r) => !r.machine || r.machine === me);
+      const resByPort = new Map(mine.map((r) => [r.port, r]));
       let serving = null, tailscaleError = null;
       try { serving = await tailscale.serveStatus(); }
       catch (e) { tailscaleError = e?.message || String(e); }
-      const report = { machine: me, tailscale: serving != null, tailscaleError, serving: serving || [], origins, unmanaged: [], problems: [] };
+      const report = {
+        machine: me, fleet: fleetInfo, reservations: mine.length,
+        tailscale: serving != null, tailscaleError, serving: serving || [], origins,
+        stale: mine.filter((r) => r.stale), ghosts: 0, wsl: [], blockIntrusions: [],
+        unmanaged: [], problems: [], notes: [],
+      };
+      if (fleetInfo && !fleetInfo.reachable) {
+        report.problems.push(`fleet server ${fleetInfo.server} is UNREACHABLE (${fleetInfo.error}) — every ledger command on this machine is failing; start it or unset PORTBOOK_SERVER (checks below ran against the LOCAL registry)`);
+      }
+      // Stale holds: self-healing (the next gc/reserve reclaims them) — notes, not failures.
+      for (const r of report.stale) {
+        report.notes.push(`hold on :${r.port} ("${r.project}") is stale — ${r.dead ? `pid ${r.pid} is dead` : "TTL expired"}; \`portbook gc\` reclaims it`);
+      }
+      // Live OS cross-reference: intrusions into block territory are the collision-in-the-making the
+      // whole territory feature exists to prevent — loud. Ghosts are usually just "not started yet".
+      const sc = await scan();
+      report.ghosts = sc.ghosts.length;
+      if (sc.ghosts.length) report.notes.push(`${sc.ghosts.length} reservation(s) with nothing listening (ghosts) — fine if those servers just aren't running; \`portbook scan\` lists them`);
+      let blocks = [];
+      try { blocks = await reg.listBlocks({}); } catch { blocks = listBlocks({}); }
+      for (const l of sc.unmanaged) {
+        const b = blockAt(blocks, l.port, me);
+        if (!b) continue;
+        report.blockIntrusions.push({ port: l.port, pid: l.pid, proc: l.proc, block: { project: b.project, rangeStart: b.rangeStart, rangeEnd: b.rangeEnd } });
+        report.problems.push(`:${l.port} (${l.proc || "?"}${l.pid ? `, pid ${l.pid}` : ""}) is LISTENING inside "${b.project}"'s block ${b.rangeStart}-${b.rangeEnd} with NO reservation — reserve/adopt it or stop it before it collides`);
+      }
+      // WSL overlap: a reserved port also listening inside a distro. If the host side isn't bound,
+      // that in-WSL listener may BE the project's server (fine) or a squatter (collision) — a note,
+      // because only the owner can tell. scan() already folded WSL listeners into the intrusion check.
+      const wslMap = await wslListenerPorts();
+      report.wsl = [...wslMap].map(([port, distro]) => ({ port, distro }));
+      for (const { port, distro } of report.wsl) {
+        const r = resByPort.get(port);
+        if (r && r.bound === false) report.notes.push(`:${port} is reserved by "${r.project}" but listening INSIDE WSL distro "${distro}" — if that's not ${r.project}'s own server, it's a cross-boundary collision (WSL2 shares localhost)`);
+      }
       if (serving) {
         const trackedByTs = new Map(origins.map((o) => [o.tsPort, o]));
         // (a) serve mappings with no matching tracked origin → UNMANAGED.
@@ -525,6 +792,8 @@ async function main() {
           if (!m) report.problems.push(`origin ${o.url} (project "${o.project}") is recorded but tailscale is NOT serving tsPort ${o.tsPort} — re-run \`portbook expose\` or \`portbook release\``);
           else if (m.localPort != null && m.localPort !== o.localPort) report.problems.push(`origin ${o.url} should proxy :${o.localPort} (project "${o.project}") but tailscale serves :${m.localPort} — drift; re-run \`portbook expose\``);
         }
+      } else if (origins.length) {
+        report.notes.push(`tailscale is unavailable (${tailscaleError}) — ${origins.length} tracked origin(s) not verified against live serve state`);
       }
       // (b2) ledger-only collision class (independent of tailscale liveness): a local port fronted by a
       // tracked origin but reserved by a DIFFERENT project, or not reserved at all; and any tsPort that
@@ -538,9 +807,8 @@ async function main() {
         if (!r) report.problems.push(`origin ${o.url} fronts local :${o.localPort} but no portbook reservation holds it — \`portbook reserve --project ${o.project} --port ${o.localPort}\``);
         else if (r.project !== o.project) report.problems.push(`origin ${o.url} (project "${o.project}") fronts local :${o.localPort}, but that port is RESERVED by "${r.project}" — collision`);
       }
-      if (a.json) { console.log(JSON.stringify(report, null, 2)); return; }
-      console.log(fmtDoctor(report));
-      if (report.unmanaged.length || report.problems.length) process.exitCode = 1; // loud: nonzero so CI/scripts catch it
+      if (report.unmanaged.length || report.problems.length) process.exitCode = 1; // loud: nonzero so CI/scripts catch it — in --json mode too
+      console.log(a.json ? JSON.stringify(report, null, 2) : fmtDoctor(report));
       return;
     }
     if (cmd === "env" || cmd === "ecosystem") {
@@ -611,6 +879,26 @@ async function main() {
       const server = process.env.PORTBOOK_SERVER;
       if (a.json) console.log(JSON.stringify({ server, imported, skipped: skipped.length, blocksImported, blocksSkipped: blocksSkipped.length }, null, 2));
       else console.log(`imported ${imported.length} reservation(s) and ${blocksImported.length} block(s) to ${server} (skipped ${skipped.length} reservation(s), ${blocksSkipped.length} block(s) already present)`);
+      return;
+    }
+    if (cmd === "init") {
+      // Adoption in one step: print the drop-in convention block, or append it to the project's
+      // agent-instructions file. Idempotent — a file that already talks about portbook is left alone.
+      if (!a.write) { console.log(CONVENTION); return; }
+      const file = typeof a.file === "string" ? a.file : "AGENTS.md";
+      const fs = await import("node:fs");
+      let existing = "";
+      try { existing = fs.readFileSync(file, "utf8"); } catch { /* new file */ }
+      if (/portbook/i.test(existing)) { console.log(`${file} already mentions portbook — nothing appended (edit it directly to refresh)`); return; }
+      fs.appendFileSync(file, (existing && !existing.endsWith("\n") ? "\n\n" : existing ? "\n" : "") + CONVENTION);
+      console.log(`appended the port convention to ${file}`);
+      return;
+    }
+    if (cmd === "completion") {
+      const shell = a._[0];
+      const script = COMPLETIONS[shell];
+      if (!script) throw new Error(`completion requires a shell: portbook completion (bash|zsh|pwsh)`);
+      console.log(script);
       return;
     }
     console.error(`unknown command: ${cmd}\n`);

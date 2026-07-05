@@ -27,11 +27,13 @@ and the [HTTP API](../../docs/INTEGRATIONS.md#raw-http-api--cli) one-for-one):
 |-------------|--------------------------------------------------------------|---------------|
 | `reserve`   | Reserve a specific port or auto-pick free one(s) in a range. | `project` (required), `port`, `count`, `purpose`, `owner`, `pid`, `ttlSec`, `rangeStart`, `rangeEnd`, `adopt` |
 | `release`   | Release reservation(s) by project, port, or id.              | one of `project` \| `port` \| `id` |
+| `renew`     | Extend a TTL hold's lifetime in place (permanent holds untouched). | `ttlSec` (required), one of `project` \| `port` \| `id` |
 | `list`      | Reserved ports (optionally filtered) + live bound/stale state.| `project` |
 | `check`     | Is a port reserved and/or OS-free right now?                 | `port` (required) |
-| `scan`      | What's actually listening here: managed / unmanaged / ghosts.| — |
+| `scan`      | What's actually listening here (host + inside WSL): managed / unmanaged / ghosts.| — |
 | `ecosystem` | Whole-machine view: host ports + containers + WSL.           | — |
-| `gc`        | Reclaim dead-PID / expired reservations.                     | — |
+| `gc`        | Reclaim dead-PID / expired / PID-reused reservations.        | — |
+| `log`       | The audit trail: who reserved/released/reclaimed what, when. | `project`, `port`, `op`, `limit` (all optional) |
 
 **Port territory** (claim a range per project — see the [README](../../README.md#port-territory-blocks)):
 

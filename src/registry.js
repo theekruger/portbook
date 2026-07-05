@@ -11,11 +11,13 @@ import os from "node:os";
 import net from "node:net";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { wslListenerPorts } from "./wsl.js";
 
 const pexec = promisify(execFile);
 
 export const DIR = process.env.PORTBOOK_DIR || path.join(os.homedir(), ".portbook");
 export const FILE = path.join(DIR, "registry.json");
+export const EVENTS_FILE = path.join(DIR, "events.jsonl");
 const LOCK = path.join(DIR, "registry.lock");
 // Holders heartbeat (touch the lock's mtime) during slow work, so "stale" really means "crashed".
 // $PORTBOOK_LOCK_STALE_MS shrinks the window so the takeover paths are testable.
@@ -115,9 +117,90 @@ export function writeRegistry(reg) {
   fs.renameSync(tmp, FILE); // atomic replace
 }
 
+// ── AUDIT TRAIL: an append-only events ledger answering "who reserved/released/reclaimed this port,
+// when, and why" — the forensic record the registry's current-state snapshot can't provide (the
+// project's origin story is an agent silently killing another project's server; this is how you find
+// out afterwards). Mutators call logEvents() INSIDE their lock, right after writeRegistry, so the
+// event order matches the write order. Logging is strictly best-effort: an events failure must never
+// fail the mutation it describes. One rotation generation (events.jsonl → events.jsonl.1) caps disk.
+const EVENTS_MAX_BYTES = Number(process.env.PORTBOOK_EVENTS_MAX_BYTES) || 1 << 20; // ~1 MiB per generation
+const ev = (op, fields) => ({ at: nowISO(), machine: machineName(), op, ...fields });
+function logEvents(events) {
+  if (!events || !events.length) return;
+  try {
+    ensureDir();
+    try { if (fs.statSync(EVENTS_FILE).size > EVENTS_MAX_BYTES) fs.renameSync(EVENTS_FILE, `${EVENTS_FILE}.1`); } catch { /* no file yet, or rotate raced — fine */ }
+    fs.appendFileSync(EVENTS_FILE, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  } catch { /* best-effort — never fail the mutation being logged */ }
+}
+// Events for rows reconcile() pruned — carries WHY each hold was reclaimed (the whole point).
+function gcEvents(removed) {
+  const t = Date.now();
+  return removed.map((r) => ev("gc", {
+    port: r.port, project: r.project, owner: r.owner, pid: r.pid || undefined,
+    reason: r.expiresAt && Date.parse(r.expiresAt) < t ? "ttl-expired" : "dead-pid",
+  }));
+}
+// Read the trail (both generations, oldest→newest), filtered by ANDed selectors, capped to the LAST
+// `limit` rows. Read-only, tolerant of torn/corrupt lines (a crash mid-append loses one line, not all).
+export function readEvents(opts = {}) {
+  const { project, port, op, limit = 200 } = opts;
+  const rows = [];
+  for (const f of [`${EVENTS_FILE}.1`, EVENTS_FILE]) {
+    let raw; try { raw = fs.readFileSync(f, "utf8"); } catch { continue; }
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try { rows.push(JSON.parse(line)); } catch { /* torn line — skip */ }
+    }
+  }
+  return rows.filter((e) =>
+    (!project || e.project === project) && (port == null || e.port === port) && (!op || e.op === op)
+  ).slice(-limit);
+}
+
 export function pidAlive(pid) {
   if (!pid) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
+// ── PID IDENTITY: a PID alone can lie — the OS reuses them, so "pid 1234 is alive" may be a NEW,
+// unrelated process wearing a dead server's number (a hold that should have been reclaimed looks
+// alive forever). The fix: record the process's START TIME with the PID at reserve time, and let gc's
+// deep check compare — same pid + different start = different process = stale hold. Best-effort on
+// every platform; null means "couldn't tell", which callers treat as "don't judge".
+
+// `ps -o etime=` emits [[dd-]hh:]mm:ss — parse to seconds. Exported for tests.
+export function parseEtime(s) {
+  const m = String(s).trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!m) return null;
+  return (Number(m[1] || 0) * 86400) + (Number(m[2] || 0) * 3600) + (Number(m[3]) * 60) + Number(m[4]);
+}
+
+// Batch start times for a set of PIDs → Map<pid, epochMs|null>. One shell-out for the whole batch.
+export async function pidStartTimes(pids) {
+  const out = new Map(pids.map((p) => [p, null]));
+  if (!pids.length) return out;
+  try {
+    if (process.platform === "win32") {
+      // -EA SilentlyContinue: dead PIDs in the batch must not fail the whole query.
+      const ps = `Get-Process -Id ${pids.join(",")} -ErrorAction SilentlyContinue | ForEach-Object {` +
+        ` [pscustomobject]@{ pid=$_.Id; start=[int64](($_.StartTime).ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds } } | ConvertTo-Json -Compress`;
+      const { stdout } = await pexec("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps], { timeout: 12000, maxBuffer: 1 << 20 });
+      const j = JSON.parse(String(stdout).trim() || "[]");
+      for (const row of Array.isArray(j) ? j : [j]) if (row && row.pid) out.set(Number(row.pid), Number(row.start) || null);
+    } else {
+      // etime (elapsed) is portable across Linux/macOS/BSD where etimes/lstart are not; second
+      // precision is plenty — the reuse comparison allows multi-second slack anyway.
+      const { stdout } = await pexec("ps", ["-o", "pid=,etime=", "-p", pids.join(",")], { timeout: 8000, maxBuffer: 1 << 20 });
+      const now = Date.now();
+      for (const line of String(stdout).split(/\r?\n/)) {
+        const m = line.trim().match(/^(\d+)\s+(\S+)$/);
+        const sec = m ? parseEtime(m[2]) : null;
+        if (m && sec != null) out.set(Number(m[1]), now - sec * 1000);
+      }
+    }
+  } catch { /* tooling absent/slow — every pid stays null (unjudgeable) */ }
+  return out;
 }
 
 // Probe a bind, preserving WHY it failed: EADDRINUSE = something holds the port; EACCES/EPERM = the
@@ -178,9 +261,16 @@ export async function reserve(opts = {}) {
   if (!Number.isInteger(count) || count < 1) throw new Error(`invalid --count ${count} — must be a positive integer`);
   return withLock(async () => {
     const reg = readRegistry();
-    reconcile(reg);
+    const pruned = reconcile(reg); // logged below — auto-reclaims are exactly what the audit trail must record
     const me = machineName();
     const blocks = reg.blocks || [];
+    // WSL2 shares the host's effective localhost port namespace (it forwards distro ports to the
+    // Windows host — and the host's own bind test can SUCCEED on a port a distro is serving, silently
+    // shadowing it). So ports listening inside a running distro are TAKEN here. One batch query per
+    // reserve; empty off-Windows / on failure / with $PORTBOOK_NO_WSL=1. Skipped for adopt (the point
+    // is registering something already running) and probe:false (a fleet server trusting the client).
+    touchLock(); // enumerating WSL can be slow — prove we're alive, not crashed
+    const wslBusy = probe && !opts.adopt ? await wslListenerPorts() : new Map();
     // A port is in a FOREIGN block when another project owns a block on THIS machine that spans it.
     // Your own project's block never blocks you (that's the whole point of reserving territory).
     // Rows/blocks without a .machine are LEGACY entries written by this machine — normalize with `me`
@@ -219,6 +309,9 @@ export async function reserve(opts = {}) {
             ? `port ${port} can't be bound on this OS (an excluded port range — on Windows see \`netsh interface ipv4 show excludedportrange protocol=tcp\` — or a privileged port). --adopt won't help: your server can't bind it either.`
             : `port ${port} is in use at the OS level. Use --adopt if this is your own running service.`);
         }
+        if (wslBusy.has(port)) {
+          throw new Error(`port ${port} is free on the Windows host but LISTENING inside WSL distro "${wslBusy.get(port)}" — WSL2 shares localhost, so binding it would collide/shadow that service. Pick another port, or --adopt if that service is this project's.`);
+        }
       }
       // Burn the grantee's pass(es) only on SUCCESS, in the same locked write as the reservation —
       // never replayable, and a throw above (port OS-busy) never reached writeRegistry, so the
@@ -241,7 +334,7 @@ export async function reserve(opts = {}) {
       let denied = 0; // ports the OS refuses to let ANYONE bind (excluded ranges / privileged)
       outer: for (const [lo, hi] of spans) {
         for (let p = lo; p <= hi && chosen.length < count; p++) {
-          if (foreignBlock(p) || taken.has(key(p)) || promised.has(p)) continue;
+          if (foreignBlock(p) || taken.has(key(p)) || promised.has(p) || wslBusy.has(p)) continue;
           if (!probe) { chosen.push(p); continue; }
           touchLock(); // heartbeat: probing a big range is slow — prove we're alive, not crashed
           const pr = await probePort(p, host);
@@ -257,12 +350,24 @@ export async function reserve(opts = {}) {
       }
     }
     const expiresAt = ttlSec ? new Date(Date.now() + ttlSec * 1000).toISOString() : null;
+    // Stamp the PID's start time so gc's deep check can spot PID REUSE later (same number, different
+    // process). Our own PID is free to stamp; others cost one guarded shell-out. null = "unknown" —
+    // the deep check then simply never judges this row.
+    let pidStartedAt = null;
+    if (pid) {
+      touchLock();
+      pidStartedAt = pid === process.pid
+        ? Math.round(Date.now() - process.uptime() * 1000)
+        : (await pidStartTimes([pid])).get(pid);
+    }
     const made = chosen.map((p) => ({
-      id: uid(), port: p, project, purpose, owner, pid, host: host || "*", machine,
+      id: uid(), port: p, project, purpose, owner, pid, pidStartedAt, host: host || "*", machine,
       status: opts.adopt ? "active" : "reserved", reservedAt: nowISO(), expiresAt,
     }));
     reg.reservations.push(...made);
     writeRegistry(reg);
+    logEvents([...gcEvents(pruned), ...made.map((m) => ev(opts.adopt ? "adopt" : "reserve",
+      { port: m.port, project, owner, pid: pid || undefined, ttlSec: ttlSec || undefined, purpose: purpose || undefined }))]);
     return made;
   });
 }
@@ -278,18 +383,44 @@ export async function release(opts = {}) {
   return withLock(async () => {
     const reg = readRegistry();
     const before = reg.reservations.length;
-    reg.reservations = reg.reservations.filter(
-      (r) => !((!id || r.id === id) && (port == null || r.port === port) && (!project || r.project === project) && (!!id || onMachine(r)))
-    );
+    const hit = (r) => (!id || r.id === id) && (port == null || r.port === port) && (!project || r.project === project) && (!!id || onMachine(r));
+    const dropped = reg.reservations.filter(hit);
+    reg.reservations = reg.reservations.filter((r) => !hit(r));
     // Drop any tailnet staging origins anchored to the released {project, local port} in the SAME
     // locked write — no orphans. An origin keys on its LOCAL port (the thing being released), and is
     // matched by the same ANDed selectors (id matches the origin's OWN id; machine scopes it). The
     // bin/teardown layer reads originsFor() first to run `tailscale serve … off` for each before this.
-    reg.origins = (reg.origins || []).filter(
-      (o) => !((!id || o.id === id) && (port == null || o.localPort === port) && (!project || o.project === project) && (!!id || !machine || (o.machine || machine) === machine))
-    );
+    const originHit = (o) => (!id || o.id === id) && (port == null || o.localPort === port) && (!project || o.project === project) && (!!id || !machine || (o.machine || machine) === machine);
+    const originsDropped = (reg.origins || []).filter(originHit);
+    reg.origins = (reg.origins || []).filter((o) => !originHit(o));
     writeRegistry(reg);
+    logEvents([
+      ...dropped.map((r) => ev("release", { port: r.port, project: r.project, owner: r.owner })),
+      ...originsDropped.map((o) => ev("origin-release", { port: o.localPort, tsPort: o.tsPort, project: o.project, url: o.url })),
+    ]);
     return before - reg.reservations.length;
+  });
+}
+
+// ── RENEW: extend a TTL hold's lifetime without releasing + re-reserving (a race window someone else
+// could snipe). Only rows that ALREADY carry an expiresAt are touched — silently attaching a TTL to a
+// PERMANENT hold would flip its contract from "lives until released" to "evaporates", the opposite of
+// what the caller wants from "keep my hold alive". Same ANDed selectors as release(). Returns the
+// renewed rows (possibly empty — the CLI reports the count, mirroring release).
+export async function renew(opts = {}) {
+  const { project, port, id, ttlSec, machine } = opts;
+  if (port == null && !project && !id) throw new Error("renew requires --port, --project, or --id");
+  if (!Number.isInteger(ttlSec) || ttlSec < 1) throw new Error("renew requires --ttl <seconds> (the new lifetime from now)");
+  const onMachine = (r) => !machine || r.machine === machine;
+  return withLock(async () => {
+    const reg = readRegistry();
+    const expiresAt = new Date(Date.now() + ttlSec * 1000).toISOString();
+    const renewed = reg.reservations.filter((r) =>
+      r.expiresAt && (!id || r.id === id) && (port == null || r.port === port) && (!project || r.project === project) && (!!id || onMachine(r)));
+    for (const r of renewed) r.expiresAt = expiresAt;
+    writeRegistry(reg);
+    logEvents(renewed.map((r) => ev("renew", { port: r.port, project: r.project, owner: r.owner, ttlSec })));
+    return renewed;
   });
 }
 
@@ -304,12 +435,12 @@ export async function reserveBlock(opts = {}) {
   }
   return withLock(async () => {
     const reg = readRegistry();
-    reconcile(reg);
+    const pruned = reconcile(reg); // logged only after the write that persists it, like reserve()
     const here = (m) => (m || machine) === machine; // missing machine == this machine
     // IDEMPOTENT under the lock: re-claiming an IDENTICAL block (same project/machine/range) — a re-run
     // bootstrap, `portbook import`, or two agents racing — returns the existing row, never a duplicate.
     const dup = reg.blocks.find((b) => here(b.machine) && b.project === project && b.rangeStart === rangeStart && b.rangeEnd === rangeEnd);
-    if (dup) { writeRegistry(reg); return dup; }
+    if (dup) { writeRegistry(reg); logEvents(gcEvents(pruned)); return dup; }
     // (a) No overlap with ANOTHER project's block on this machine (your own block overlapping is fine).
     for (const b of reg.blocks) {
       if (!here(b.machine) || b.project === project) continue;
@@ -327,6 +458,7 @@ export async function reserveBlock(opts = {}) {
     const block = { id: uid(), project, rangeStart, rangeEnd, owner, purpose, machine, reservedAt: nowISO() };
     reg.blocks.push(block);
     writeRegistry(reg);
+    logEvents([...gcEvents(pruned), ev("block", { project, range: `${rangeStart}-${rangeEnd}`, owner: owner || undefined })]);
     return block;
   });
 }
@@ -338,10 +470,11 @@ export async function releaseBlock(opts = {}) {
     const reg = readRegistry();
     const before = reg.blocks.length;
     // Same AND semantics as release(): match every supplied selector; `id` is global (machine-exempt).
-    reg.blocks = reg.blocks.filter(
-      (b) => !((!id || b.id === id) && (!project || b.project === project) && (!!id || !machine || b.machine === machine))
-    );
+    const hit = (b) => (!id || b.id === id) && (!project || b.project === project) && (!!id || !machine || b.machine === machine);
+    const dropped = reg.blocks.filter(hit);
+    reg.blocks = reg.blocks.filter((b) => !hit(b));
     writeRegistry(reg);
+    logEvents(dropped.map((b) => ev("block-release", { project: b.project, range: `${b.rangeStart}-${b.rangeEnd}` })));
     return before - reg.blocks.length;
   });
 }
@@ -369,7 +502,7 @@ export async function requestPort(opts = {}) {
   if (!validPort(port)) throw new Error(`invalid port ${port} — must be an integer 1-65535`);
   return withLock(async () => {
     const reg = readRegistry();
-    reconcile(reg); // a dead/expired hold isn't worth asking about — prune first, like reserve()
+    const pruned = reconcile(reg); // prune first, like reserve(); audited after the persisting write
     const me = machineName();
     // Who holds the port on that machine? Machine-less rows/blocks are the registry HOST's — the
     // same normalization reserve() applies. A reservation outranks a block (it's the finer claim).
@@ -385,7 +518,7 @@ export async function requestPort(opts = {}) {
     // The write persists what reconcile pruned.
     const dup = reg.requests.find((q) => q.status === "pending" && q.fromProject === fromProject &&
       q.port === port && q.targetProject === holder.project && (q.targetMachine || me) === machine);
-    if (dup) { writeRegistry(reg); return dup; }
+    if (dup) { writeRegistry(reg); logEvents(gcEvents(pruned)); return dup; }
     // Cap pending asks per requester — a runaway agent can't wallpaper every inbox on the machine.
     const pending = reg.requests.filter((q) => q.status === "pending" && q.fromProject === fromProject);
     if (pending.length >= 32) throw new Error(`"${fromProject}" already has ${pending.length} pending requests — resolve some (or let them age out) first`);
@@ -396,6 +529,7 @@ export async function requestPort(opts = {}) {
     };
     reg.requests.push(req);
     writeRegistry(reg);
+    logEvents([...gcEvents(pruned), ev("request", { port, project: fromProject, target: holder.project, reason: reason || undefined })]);
     return req;
   });
 }
@@ -431,7 +565,7 @@ export async function resolveRequest(opts = {}) {
   if (action !== "grant" && action !== "deny") throw new Error(`invalid action "${action}" — must be "grant" or "deny"`);
   return withLock(async () => {
     const reg = readRegistry();
-    reconcile(reg);
+    const pruned = reconcile(reg); // audited after the persisting write below
     const req = reg.requests.find((q) => q.id === id);
     if (!req) throw new Error(`no request with id ${id} (it may have aged out)`);
     if (req.status !== "pending") throw new Error(`request ${id} is already ${req.status}`);
@@ -449,6 +583,8 @@ export async function resolveRequest(opts = {}) {
       releasedReservation = reg.reservations.length < before;
     }
     writeRegistry(reg);
+    logEvents([...gcEvents(pruned), ev(req.status === "granted" ? "grant" : "deny",
+      { port: req.port, project: req.fromProject, target: req.targetProject, note: note || undefined, releasedReservation: releasedReservation || undefined })]);
     return { ...req, releasedReservation };
   });
 }
@@ -457,7 +593,31 @@ export async function gc() {
   return withLock(async () => {
     const reg = readRegistry();
     const removed = reconcile(reg);
+    const events = gcEvents(removed);
+    // DEEP check, gc-only (it shells out — too slow for every reserve/list): PID REUSE. A local hold
+    // whose pid is "alive" may be a new, unrelated process wearing the number. If we stamped the
+    // original's start time at reserve, a mismatched current start time unmasks the impostor — the
+    // real owner is dead, reclaim the hold. Unknown start times (either side) are never judged.
+    const me = machineName();
+    const suspects = reg.reservations.filter((r) => (!r.machine || r.machine === me) && r.pid && r.pidStartedAt);
+    if (suspects.length) {
+      touchLock(); // the batch start-time query can be slow (PowerShell) — heartbeat first
+      const starts = await pidStartTimes([...new Set(suspects.map((r) => r.pid))]);
+      const reused = new Set();
+      for (const r of suspects) {
+        const cur = starts.get(r.pid);
+        // 5s slack absorbs etime's second-granularity and clock jitter; a REUSED pid differs by far more.
+        if (cur != null && Math.abs(cur - r.pidStartedAt) > 5000) reused.add(r.id);
+      }
+      if (reused.size) {
+        const gone = reg.reservations.filter((r) => reused.has(r.id));
+        reg.reservations = reg.reservations.filter((r) => !reused.has(r.id));
+        removed.push(...gone);
+        events.push(...gone.map((r) => ev("gc", { port: r.port, project: r.project, owner: r.owner, pid: r.pid, reason: "pid-reused" })));
+      }
+    }
     writeRegistry(reg);
+    logEvents(events);
     return removed;
   });
 }
@@ -623,6 +783,13 @@ export async function scan() {
   const mine = reg.reservations.filter((r) => !r.machine || r.machine === me);
   const reserved = new Map(mine.map((r) => [r.port, r]));
   const listeners = await getListeners();
+  // Fold in ports listening INSIDE running WSL distros (Windows; empty elsewhere): WSL2 shares the
+  // host's effective localhost namespace, so they're real collision surface even when the host's own
+  // listener table doesn't show a relay for them. Labeled `wsl:<distro>` so triage is obvious.
+  const hostPorts = new Set(listeners.map((l) => l.port));
+  for (const [port, distro] of await wslListenerPorts()) {
+    if (!hostPorts.has(port)) listeners.push({ port, pid: null, proc: `wsl:${distro}` });
+  }
   const seen = new Set();
   const managed = [], unmanaged = [];
   for (const l of listeners) {
@@ -670,6 +837,7 @@ export async function addOrigin(opts = {}) {
       reg.origins.push(origin);
     }
     writeRegistry(reg);
+    logEvents([ev("expose", { port: localPort, tsPort, project, url })]);
     return origin;
   });
 }
@@ -706,10 +874,11 @@ export async function removeOrigin(opts = {}) {
   return withLock(async () => {
     const reg = readRegistry();
     const before = reg.origins.length;
-    reg.origins = reg.origins.filter(
-      (o) => !((!id || o.id === id) && (port == null || o.localPort === port) && (!project || o.project === project) && (!!id || !machine || (o.machine || machine) === machine))
-    );
+    const hit = (o) => (!id || o.id === id) && (port == null || o.localPort === port) && (!project || o.project === project) && (!!id || !machine || (o.machine || machine) === machine);
+    const dropped = reg.origins.filter(hit);
+    reg.origins = reg.origins.filter((o) => !hit(o));
     writeRegistry(reg);
+    logEvents(dropped.map((o) => ev("origin-release", { port: o.localPort, tsPort: o.tsPort, project: o.project, url: o.url })));
     return before - reg.origins.length;
   });
 }

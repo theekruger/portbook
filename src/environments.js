@@ -13,6 +13,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { list, getListeners, machineName } from "./registry.js";
+import { parseWslList, getWsl } from "./wsl.js";
+// WSL enumeration lives in src/wsl.js (registry.js needs it too for the reserve-time WSL port check,
+// and importing environments.js from there would be the cycle CLAUDE.md forbids). Re-exported here so
+// existing importers (`portbook/environments`) keep working.
+export { parseWslList, getWsl };
 
 const pexec = promisify(execFile);
 
@@ -81,32 +86,6 @@ export async function getContainers() {
     for (const c of cs) if (c.id && !byId.has(c.id)) byId.set(c.id, c);
   }
   return { containers: [...byId.values()], runtimes };
-}
-
-// WSL distros (Windows only). Informational: ports INSIDE a distro aren't visible from here without a
-// reporter running in it — but WSL2 auto-forwards many to localhost, so they often appear as host
-// listeners owned by `wslrelay.exe`. We surface the distros so the picture is complete.
-
-// Parse raw `wsl.exe -l -v` bytes (exported for tests). wsl emits UTF-16LE by default but honors
-// WSL_UTF8=1 (plain UTF-8) — sniff instead of assuming: this ASCII-range table always interleaves
-// NUL high bytes in UTF-16LE, and valid UTF-8 text never contains NUL. The STATE column can be
-// multiword on localized Windows ("Wird ausgeführt"), so match it lazily up to the trailing VERSION.
-export function parseWslList(buf) {
-  const text = buf.includes(0) ? buf.toString("utf16le") : buf.toString("utf8");
-  const out = [];
-  for (const line of text.split(/\r?\n/).slice(1)) { // skip the header row
-    const m = line.match(/^(\*?)\s*(\S+)\s+(.+?)\s+(\d+)\s*$/);
-    if (m) out.push({ name: m[2], state: m[3], version: Number(m[4]), default: m[1] === "*" });
-  }
-  return out;
-}
-
-export async function getWsl() {
-  if (process.platform !== "win32") return [];
-  try {
-    const { stdout } = await pexec("wsl.exe", ["-l", "-v"], { timeout: 8000, maxBuffer: 1 << 20, encoding: "buffer" });
-    return parseWslList(stdout);
-  } catch { return []; }
 }
 
 // The whole picture for THIS machine: every host listener (labeled with its owning container or
