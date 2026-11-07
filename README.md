@@ -79,6 +79,29 @@ through, and **releases the hold when the command exits** — Ctrl-C, crash, or 
 carries the wrapper's own PID, so even a hard-killed wrapper can't leak the port past the next
 `gc`/`reserve`. Exit code passes through, so scripts and CI wrap cleanly.
 
+## Permanent service assignments (`ensure`)
+
+Use a stable project + service name when a development app should keep the same numeric port after stopping and restarting:
+
+```bash
+portbook ensure --project myapp --service web --range 4200-4299
+portbook ensure --project myapp --service web --json   # retrieves the same assignment
+```
+
+The library equivalent is `await ensure({ project: "myapp", service: "web", rangeStart: 4200, rangeEnd: 4299 })`, imported from `portbook`. It returns a one-element reservation array, like `reserve`.
+
+Lookup and creation share the registry lock. Concurrent calls for the same `{ machine, project, service }` receive the same reservation; different services receive distinct ports. These assignments have no PID or TTL and remain until explicitly released. Use `release` with the returned port or reservation ID to retire one.
+
+`ensure` is local-registry only; the CLI rejects fleet mode explicitly. It supports `--port`, `--range`, `--host`, `--purpose`, `--owner`, and `--json`. Service names contain 1–80 printable characters. It rejects multiple-port counts and PID/TTL lifetimes. A range guides new allocations; it does not move an existing service. An explicitly different port or host is an error.
+
+Retrieving an assignment does not probe the socket: the application may already be listening. The application's actual bind can still fail if an unmanaged process has taken the port. An assignment is cooperative bookkeeping, not an OS socket reservation.
+
+The existing `reserve` and `run` commands keep their creation/lifetime behavior. Use `ensure` for a permanent identity, and `run` for a hold released when its child exits.
+
+### Registry read failures
+
+Malformed JSON or invalid reservation collections fail without changing the original file. Repeating the operation continues to fail until the ledger is repaired or restored. Read-only commands do not move corrupted data aside, which could otherwise make the next request mistake a damaged ledger for a first run. Missing additive collections in older valid registries remain supported; present collections with invalid types are rejected.
+
 ## Port territory (blocks)
 Reserving one port at a time works, but for a project with several long-lived services it's cleaner
 to claim a whole **range as territory** up front, then let portbook hand out ports inside it:

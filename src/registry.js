@@ -91,20 +91,36 @@ export function readRegistry() {
   try {
     const j = JSON.parse(raw);
     if (!j || typeof j !== "object" || Array.isArray(j)) throw new Error("not a registry object");
-    if (!Array.isArray(j.reservations)) j.reservations = [];
-    if (!Array.isArray(j.blocks)) j.blocks = [];
-    if (!Array.isArray(j.requests)) j.requests = [];
-    // origins[] (tailnet staging origins) is a v0.6.0 addition — a registry written by an older
-    // portbook simply lacks the field; normalize it so every reader/writer round-trips it gracefully
-    // (additive migration: nothing else in the on-disk shape changes).
-    if (!Array.isArray(j.origins)) j.origins = [];
+    if (j.version !== undefined && j.version !== 1) throw new Error("unsupported registry version");
+    if (!Array.isArray(j.reservations)) throw new Error("reservations must be an array");
+    // Missing additive collections are legacy data; present-but-damaged ones are not.
+    for (const field of ["blocks", "requests", "origins"]) {
+      if (j[field] === undefined) j[field] = [];
+      else if (!Array.isArray(j[field])) throw new Error(`${field} must be an array`);
+    }
+    const ports = new Set(), services = new Set();
+    for (const r of j.reservations) {
+      if (!r || !validPort(r.port) || typeof r.project !== "string" || !r.project.trim()) {
+        throw new Error("invalid reservation");
+      }
+      const machine = r.machine || machineName();
+      const key = JSON.stringify([machine, r.port]);
+      if (ports.has(key)) throw new Error("duplicate reserved port on the same machine");
+      ports.add(key);
+      if (r.service != null) {
+        if (typeof r.service !== "string" || !r.service.trim() || r.service.length > 80 || /[\x00-\x1f]/.test(r.service)) {
+          throw new Error("invalid reservation service");
+        }
+        const serviceKey = JSON.stringify([machine, r.project, r.service]);
+        if (services.has(serviceKey)) throw new Error("duplicate service assignment on the same machine");
+        services.add(serviceKey);
+      }
+    }
     return j;
   } catch (e) {
-    // Corrupt ledger: QUARANTINE the evidence and abort loudly — never read "empty" and let a
-    // mutator write a one-entry registry over everyone's reservations and blocks.
-    const quarantine = `${FILE}.corrupt-${Date.now()}`;
-    try { fs.renameSync(FILE, quarantine); } catch { /* best-effort */ }
-    throw new Error(`registry ${FILE} is corrupt (${e.message}) — moved to ${quarantine}; inspect/restore it, then retry`);
+    // Reads must not move the file: after quarantine-by-rename a retry would see
+    // ENOENT and could overwrite the ledger with a fresh, empty set of reservations.
+    throw new Error(`registry ${FILE} is corrupt (${e.message}) — original file preserved; inspect/restore it, then retry`);
   }
 }
 export function writeRegistry(reg) {
@@ -250,19 +266,45 @@ export function reconcile(reg) {
   return removed;
 }
 
-export async function reserve(opts = {}) {
+export async function reserve(opts = {}) { return reserveInternal(opts); }
+
+// A named, permanent service assignment. Reuse and creation happen under ONE
+// registry lock, so simultaneous callers cannot create two holds for one service.
+export async function ensure(opts = {}) {
+  if (typeof opts.service !== "string" || !opts.service.trim() || opts.service.length > 80 || /[\x00-\x1f]/.test(opts.service)) {
+    throw new Error("ensure requires a service name of 1–80 printable characters");
+  }
+  if ((opts.count != null && opts.count !== 1) || opts.pid != null || opts.ttlSec != null) {
+    throw new Error("ensure creates one permanent assignment; count, pid and ttlSec lifetimes are not supported");
+  }
+  return reserveInternal(opts, opts.service);
+}
+
+async function reserveInternal(opts = {}, service = null) {
   const { project, port, count = 1, purpose = null, owner = null, host = null, pid = null, ttlSec = null,
     machine = machineName(), probe = true } = opts;
   const explicitRange = opts.rangeStart != null || opts.rangeEnd != null;
   const rangeStart = opts.rangeStart || 4000;
   const rangeEnd = opts.rangeEnd || 4999;
-  if (!project) throw new Error("reserve requires a --project");
+  if (typeof project !== "string" || !project.trim()) throw new Error("reserve requires a --project");
+  if (service != null && (typeof machine !== "string" || !machine.trim())) throw new Error("ensure requires a machine name");
   if (port != null && !validPort(port)) throw new Error(`invalid port ${port} — must be an integer 1-65535`);
   if (!Number.isInteger(count) || count < 1) throw new Error(`invalid --count ${count} — must be a positive integer`);
   return withLock(async () => {
     const reg = readRegistry();
-    const pruned = reconcile(reg); // logged below — auto-reclaims are exactly what the audit trail must record
     const me = machineName();
+    if (service != null) {
+      const existing = reg.reservations.find((r) => (r.machine || me) === machine && r.project === project && r.service === service);
+      if (existing) {
+        if (existing.pid != null || existing.expiresAt != null) throw new Error("existing service assignment is not permanent");
+        if (port != null && port !== existing.port) throw new Error(`service "${service}" is already assigned port ${existing.port}`);
+        if (host != null && host !== existing.host) throw new Error(`service "${service}" is already assigned host ${existing.host}`);
+        // An assignment lookup is not a bind test. The app may already be running;
+        // its eventual listen() remains responsible for detecting an OS conflict.
+        return [{ ...existing }];
+      }
+    }
+    const pruned = reconcile(reg); // logged below — auto-reclaims are exactly what the audit trail must record
     const blocks = reg.blocks || [];
     // WSL2 shares the host's effective localhost port namespace (it forwards distro ports to the
     // Windows host — and the host's own bind test can SUCCEED on a port a distro is serving, silently
@@ -361,13 +403,13 @@ export async function reserve(opts = {}) {
         : (await pidStartTimes([pid])).get(pid);
     }
     const made = chosen.map((p) => ({
-      id: uid(), port: p, project, purpose, owner, pid, pidStartedAt, host: host || "*", machine,
+      id: uid(), port: p, project, ...(service != null ? { service } : {}), purpose, owner, pid, pidStartedAt, host: host || "*", machine,
       status: opts.adopt ? "active" : "reserved", reservedAt: nowISO(), expiresAt,
     }));
     reg.reservations.push(...made);
     writeRegistry(reg);
     logEvents([...gcEvents(pruned), ...made.map((m) => ev(opts.adopt ? "adopt" : "reserve",
-      { port: m.port, project, owner, pid: pid || undefined, ttlSec: ttlSec || undefined, purpose: purpose || undefined }))]);
+      { port: m.port, project, ...(service != null ? { service } : {}), owner, pid: pid || undefined, ttlSec: ttlSec || undefined, purpose: purpose || undefined }))]);
     return made;
   });
 }
