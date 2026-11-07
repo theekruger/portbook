@@ -5,6 +5,11 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- Add local `ensure` CLI/library support for atomic, permanent project/service assignments while retaining `reserve` behavior.
+- Preserve malformed registry files in place so retrying cannot initialize an empty ledger; reject invalid reservation collections and duplicate assignments.
+
 ## [0.5.0] - 2026-06-11
 
 Port **negotiation** — when a port you want is held, you ask through the ledger instead of

@@ -27,6 +27,8 @@ There's nothing to compile — run the source directly.
 `npm test` runs every suite in sequence; each one points at a throwaway `PORTBOOK_DIR` so it never
 touches your real registry:
 
+- `test/ensure.js` — named permanent assignments, CLI behavior and actual concurrent request processes.
+- `test/registry-integrity.js` — malformed data stays blocked across retries without changing the file.
 - `test/smoke.js` — registry core: reserve / release / list / check / gc / scan, locking, OS reconcile.
 - `test/environments.js` — environment providers: port parsing + the cross-referenced ecosystem view.
 - `test/parsers.js` — the OS listener-table parsers (ss / lsof / netstat / PowerShell), fed captured

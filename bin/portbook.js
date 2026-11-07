@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { reserve, release, renew, list, check, gc, scan, annotate, machineName, FILE, reserveBlock, releaseBlock, listBlocks, blockAt, requestPort, inbox, outbox, resolveRequest, addOrigin, listOrigins, originsFor, readEvents } from "../src/registry.js";
+import { reserve, ensure, release, renew, list, check, gc, scan, annotate, machineName, FILE, reserveBlock, releaseBlock, listBlocks, blockAt, requestPort, inbox, outbox, resolveRequest, addOrigin, listOrigins, originsFor, readEvents } from "../src/registry.js";
 import { ecosystem } from "../src/environments.js";
 import { wslListenerPorts } from "../src/wsl.js";
 import * as tailscale from "../src/tailscale.js";
@@ -32,6 +32,8 @@ const HELP = `portbook — machine-wide port registry (so agents & servers stop 
 Usage:
   portbook run --project <name> [--port <p>] [--range <a-b>] [--env PORT] [--ttl <s>] -- <cmd> [args...]
                                                             # reserve → run cmd with $PORT set → release on exit
+  portbook ensure --project <name> --service <name> [--port <p> | --range <a-b>] [--host <address>] [--json]
+                                                            # get or create a permanent service assignment (local mode)
   portbook reserve --project <name> [--port <p> | --count <n>] [--range <a-b>]
                    [--purpose "..."] [--owner <agent>] [--pid <pid>] [--ttl <seconds>] [--adopt] [--json]
   portbook release (--project <name> | --port <p> | --id <id>)
@@ -113,7 +115,7 @@ first, against the shared machine-wide registry (\`portbook\` is on PATH).
 `;
 
 // Verb + flag vocab for `portbook completion` — keep in sync with HELP above.
-const VERBS = "run reserve release renew adopt expose origins block blocks request inbox requests grant deny list scan log doctor env serve mcp check gc fleet report import init completion where help";
+const VERBS = "run ensure reserve release renew adopt expose origins block blocks request inbox requests grant deny list scan log doctor env serve mcp check gc fleet report import init completion where help";
 const FLAGS = "--project --port --count --range --purpose --owner --pid --ttl --adopt --json --from --reason --wait --timeout --note --id --block --blocks --https --env --op --limit --file --write --bind --open --no-probe --help";
 const COMPLETIONS = {
   bash: `# portbook bash completion — eval "$(portbook completion bash)" or drop in /etc/bash_completion.d/
@@ -394,6 +396,20 @@ async function main() {
   try {
     if (!cmd || cmd === "help" || a.help) { console.log(HELP); return; }
     if (cmd === "where") { console.log(remote ? process.env.PORTBOOK_SERVER : FILE); return; }
+    if (cmd === "ensure") {
+      if (remote) throw new Error("ensure currently supports local registries only; unset PORTBOOK_SERVER to use it locally");
+      const [rangeStart, rangeEnd] = parseRange(a.range);
+      const made = await ensure({
+        project: a.project, service: a.service, port: requireInt("--port", a.port),
+        host: typeof a.host === "string" ? a.host : undefined,
+        purpose: typeof a.purpose === "string" ? a.purpose : undefined,
+        owner: typeof a.owner === "string" ? a.owner : undefined,
+        count: requireInt("--count", a.count), pid: requireInt("--pid", a.pid), ttlSec: requireInt("--ttl", a.ttl),
+        rangeStart, rangeEnd,
+      });
+      console.log(a.json ? JSON.stringify(made, null, 2) : made[0].port);
+      return;
+    }
     if (cmd === "reserve") {
       const [rangeStart, rangeEnd] = parseRange(a.range);
       const made = await reg.reserve({

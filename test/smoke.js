@@ -101,14 +101,13 @@ const pr = await probePort(busy);
 ok("probePort reports a bound port as EADDRINUSE", pr.free === false && pr.code === "EADDRINUSE");
 ok("probePort reports a free port as free", (await probePort(43999)).free === true);
 
-// ── a corrupt ledger is QUARANTINED, never silently wiped (run last — it nukes the registry) ─────
+// ── corrupt reads preserve the original so retries cannot initialize an empty ledger ────────────
 fs.writeFileSync(FILE, "{ definitely not json");
-let corrupt = false; try { await reserve({ project: "x", port: 43500, adopt: true }); } catch { corrupt = true; }
-ok("mutating over a corrupt registry throws", corrupt);
-const quarantined = fs.readdirSync(process.env.PORTBOOK_DIR).filter((f) => f.startsWith("registry.json.corrupt-"));
-ok("corrupt ledger bytes are quarantined intact",
-  quarantined.length === 1 && fs.readFileSync(path.join(process.env.PORTBOOK_DIR, quarantined[0]), "utf8") === "{ definitely not json");
-ok("corrupt file was moved aside, not overwritten in place", !fs.existsSync(FILE));
+for (let attempt = 0; attempt < 2; attempt++) {
+  let corrupt = false; try { await reserve({ project: "x", port: 43500, adopt: true }); } catch { corrupt = true; }
+  ok(`mutating over a corrupt registry throws on attempt ${attempt + 1}`, corrupt);
+}
+ok("corrupt ledger bytes remain intact at the original path", fs.readFileSync(FILE, "utf8") === "{ definitely not json");
 
 srv.close();
 fs.rmSync(process.env.PORTBOOK_DIR, { recursive: true, force: true });
